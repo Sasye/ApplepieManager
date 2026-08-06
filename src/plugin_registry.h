@@ -190,7 +190,7 @@ static void LoadEnabledPlugins(void (*logFn)(const char*, ...) = nullptr) {
         if (!p.enabled) {
             p.loaded = false;
             p.active = false;
-            if (logFn) logFn("[PM] Skipped (disabled): %s", p.dllName);
+            if (logFn) logFn("[AM] Skipped (disabled): %s", p.dllName);
             continue;
         }
 
@@ -201,17 +201,17 @@ static void LoadEnabledPlugins(void (*logFn)(const char*, ...) = nullptr) {
             ResolvePluginInterface(p);
             if (logFn) {
                 if (p.hasInterface) {
-                    logFn("[PM] Loaded: %s [%s v%s]",
+                    logFn("[AM] Loaded: %s [%s v%s]",
                           p.dllName, p.displayName ? p.displayName : "?",
                           p.version ? p.version : "?");
                 } else {
-                    logFn("[PM] Loaded: %s (no standard interface)", p.dllName);
+                    logFn("[AM] Loaded: %s (no standard interface)", p.dllName);
                 }
             }
         } else {
             p.loaded = false;
             p.active = false;
-            if (logFn) logFn("[PM] FAILED to load: %s (err=%lu)", p.dllName, GetLastError());
+            if (logFn) logFn("[AM] FAILED to load: %s (err=%lu)", p.dllName, GetLastError());
         }
     }
 }
@@ -264,6 +264,8 @@ static void SavePluginStates(ConfigFile& cfg) {
         ConfigSetValue(cfg, g_plugins[i].dllName,
                        g_plugins[i].enabled ? "1" : "0", "plugins");
     }
+    // Note: UID hide settings are saved by the caller (imgui_panel.h)
+    // since the UID state variables are defined in il2cpp_text_scanner.h
     SaveConfigFile(cfg);
 }
 

@@ -69,6 +69,7 @@ static bool  g_menuUidHidden = true;
 static bool  g_menuNameHidden = true;
 static bool  g_cardUidHidden = true;
 static bool  g_cardNameHidden = true;
+static volatile bool  g_hookDisabled = false;  // Set during shutdown to prevent IL2CPP calls
 
 // ============================================================================
 // IL2CPP String reading
@@ -225,6 +226,7 @@ static bool InitIL2CppScanner() {
 // ============================================================================
 
 static void* TryFindGO(const char* path) {
+    if (g_hookDisabled) return nullptr;
     if (!g_methodGameObjectFind || !p_il2cpp_string_new) return nullptr;
     void* dom = p_il2cpp_domain_get();
     p_il2cpp_thread_attach(dom);
@@ -274,10 +276,11 @@ static bool FindUidComponent() {
 }
 
 static void GameObjectSetActive(void* go, bool active) {
-    if (!go || !g_methodGameObjectSetActive) return;
-    void* dom = p_il2cpp_domain_get();
-    p_il2cpp_thread_attach(dom);
+    if (!go || !g_methodGameObjectSetActive || g_hookDisabled) return;
     __try {
+        void* dom = p_il2cpp_domain_get();
+        if (!dom) return;
+        p_il2cpp_thread_attach(dom);
         int32_t val = active ? 1 : 0;
         void* params[1] = { &val };
         SafeInvoke(g_methodGameObjectSetActive, go, params);
@@ -325,17 +328,16 @@ static tNativeGetName      g_nativeGetName = nullptr;
 static tNativeGetTransform g_nativeGetTransform = nullptr;
 static tNativeGetParent    g_nativeGetParent = nullptr;
 static void*          g_cachedEmptyStr = nullptr;
-static volatile bool  g_hookDisabled = false;
 
 // Component pointer cache — avoids native calls for known components
-enum HideType { HT_UID = 0, HT_MENU_NAME, HT_CARD_UID, HT_CARD_NAME };
+enum HideType { HT_MENU_UID = 0, HT_MENU_NAME, HT_CARD_UID, HT_CARD_NAME };
 struct CachedComp { void* comp; HideType type; };
 static CachedComp g_compCache[16] = {};
 static volatile int g_compCacheCount = 0;
 
 static bool IsHideActive(HideType t) {
     switch (t) {
-        case HT_UID:       return g_uidHidden || g_menuUidHidden;
+        case HT_MENU_UID:  return g_menuUidHidden;
         case HT_MENU_NAME: return g_menuNameHidden;
         case HT_CARD_UID:  return g_cardUidHidden;
         case HT_CARD_NAME: return g_cardNameHidden;
@@ -356,6 +358,12 @@ static void CacheComp(void* comp, HideType type) {
 }
 
 static void hkTMPSetText(void* __this, void* value, void* methodInfo) {
+    // SHUTDOWN: passthrough immediately — g_cachedEmptyStr may be freed by IL2CPP GC
+    if (g_hookDisabled) {
+        g_origSetText(__this, value, methodInfo);
+        return;
+    }
+
     // FAST PATH: cached pointer check (no native calls — deadlock-proof)
     int n = g_compCacheCount;
     for (int i = 0; i < n; i++) {
@@ -378,8 +386,8 @@ static void hkTMPSetText(void* __this, void* value, void* methodInfo) {
                         char name[64];
                         if (ReadIL2CppString(nameStr, name, sizeof(name)) > 0) {
                             if (strcmp(name, "ManagerNumber") == 0) {
-                                CacheComp(__this, HT_UID);
-                                if (g_uidHidden || g_menuUidHidden) {
+                                CacheComp(__this, HT_MENU_UID);
+                                if (g_menuUidHidden) {
                                     g_origSetText(__this, g_cachedEmptyStr, methodInfo);
                                     return;
                                 }

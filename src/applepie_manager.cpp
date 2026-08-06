@@ -40,6 +40,7 @@ void Log(const char *fmt, ...) {
 // Manager Config (global for imgui_panel.h's Save button)
 // ============================================================================
 ConfigFile g_managerConfig;
+static int g_configLang = 0; // 0=zh, 1=en — applied after imgui_panel.h defines g_lang
 
 // ============================================================================
 // Hotkey Polling Thread
@@ -95,9 +96,37 @@ static DWORD WINAPI InitThread(LPVOID) {
     // Load manager config
     g_managerConfig = LoadConfigFile("plugin\\applepie_manager_config.txt");
     if (!g_managerConfig.loaded) {
-        Log("[AM] WARNING: applepie_manager_config.txt not found, using defaults");
+        Log("[AM] Config not found, generating defaults");
+        g_managerConfig.filePath = "plugin\\applepie_manager_config.txt";
+        g_managerConfig.loaded = true;
+
+        // [general] section
+        ConfigSetValue(g_managerConfig, "language", "zh", "general");
+
+        // [uid] section with defaults
+        ConfigSetValue(g_managerConfig, "hide_uid",       "1", "uid");
+        ConfigSetValue(g_managerConfig, "hide_ping",      "0", "uid");
+        ConfigSetValue(g_managerConfig, "hide_menu_uid",  "1", "uid");
+        ConfigSetValue(g_managerConfig, "hide_menu_name", "1", "uid");
+        ConfigSetValue(g_managerConfig, "hide_card_uid",  "1", "uid");
+        ConfigSetValue(g_managerConfig, "hide_card_name", "1", "uid");
+
+        SaveConfigFile(g_managerConfig);
+        Log("[AM] Default config generated");
     } else {
         Log("[AM] Config loaded");
+
+        // Read language setting
+        const char* langVal = ConfigGetValue(g_managerConfig, "language", "general");
+        if (langVal && strcmp(langVal, "en") == 0) g_configLang = 1;
+
+        // Apply UID hide settings from config
+        g_uidHidden      = ConfigGetBool(g_managerConfig, "hide_uid",       true,  "uid");
+        g_pingHidden     = ConfigGetBool(g_managerConfig, "hide_ping",      false, "uid");
+        g_menuUidHidden  = ConfigGetBool(g_managerConfig, "hide_menu_uid",  true,  "uid");
+        g_menuNameHidden = ConfigGetBool(g_managerConfig, "hide_menu_name", true,  "uid");
+        g_cardUidHidden  = ConfigGetBool(g_managerConfig, "hide_card_uid",  true,  "uid");
+        g_cardNameHidden = ConfigGetBool(g_managerConfig, "hide_card_name", true,  "uid");
     }
 
     // Scan plugin directory
@@ -118,6 +147,9 @@ static DWORD WINAPI InitThread(LPVOID) {
     }
     Log("[AM] Summary: %d/%d loaded, %d with standard interface",
         loadedCount, g_pluginCount, interfaceCount);
+
+    // Apply saved language setting
+    g_lang = (g_configLang == 1) ? LANG_EN : LANG_ZH;
 
     // Sync initial language to all plugins
     BroadcastLanguage(g_lang == LANG_ZH ? "zh" : "en");
@@ -141,18 +173,19 @@ static DWORD WINAPI InitThread(LPVOID) {
     CreateThread(NULL, 0, [](LPVOID) -> DWORD {
         // Wait for game window to actually exist
         HWND wnd = nullptr;
-        for (int w = 0; w < 120; w++) {
+        for (int w = 0; w < 120 && !g_hookDisabled; w++) {
             wnd = FindWindowW(L"UnityWndClass", nullptr);
             if (wnd) break;
             Sleep(500);
         }
-        if (!wnd) return 0;
+        if (!wnd || g_hookDisabled) return 0;
 
         // Retry until UID GO is found or game closes
         int attempt = 0;
-        while (IsWindow(wnd)) {
-            Sleep(2000);
-            if (!IsWindow(wnd)) break;
+        while (IsWindow(wnd) && !g_hookDisabled) {
+            // Sleep in short intervals so we can exit quickly
+            for (int s = 0; s < 20 && !g_hookDisabled; s++) Sleep(100);
+            if (!IsWindow(wnd) || g_hookDisabled) break;
             __try {
                 if (g_uidHidden) {
                     SetUidVisible(false);
@@ -193,6 +226,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
         g_hookDisabled = true;  // Make hook passthrough immediately
         g_hotkeyRunning = false;
         g_overlayRunning = false;
+        MemoryBarrier();        // Ensure all threads see the flags NOW
     }
     return TRUE;
 }

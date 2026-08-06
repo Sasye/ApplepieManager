@@ -346,6 +346,22 @@ static void CleanupOverlayDeviceD3D() {
 // Toggle Panel (same as EIEM ToggleGui)
 // ============================================================================
 
+// ============================================================================
+// Auto-save config helper
+// ============================================================================
+static void SaveAllConfig() {
+    extern ConfigFile g_managerConfig;
+    ConfigSetValue(g_managerConfig, "language",
+                   g_lang == LANG_ZH ? "zh" : "en", "general");
+    ConfigSetValue(g_managerConfig, "hide_uid",       g_uidHidden       ? "1" : "0", "uid");
+    ConfigSetValue(g_managerConfig, "hide_ping",      g_pingHidden      ? "1" : "0", "uid");
+    ConfigSetValue(g_managerConfig, "hide_menu_uid",  g_menuUidHidden   ? "1" : "0", "uid");
+    ConfigSetValue(g_managerConfig, "hide_menu_name", g_menuNameHidden  ? "1" : "0", "uid");
+    ConfigSetValue(g_managerConfig, "hide_card_uid",  g_cardUidHidden   ? "1" : "0", "uid");
+    ConfigSetValue(g_managerConfig, "hide_card_name", g_cardNameHidden  ? "1" : "0", "uid");
+    SavePluginStates(g_managerConfig);
+}
+
 static void TogglePanel() {
     if (!g_overlayHwnd) return;
     g_panelVisible = !g_panelVisible;
@@ -464,6 +480,7 @@ static void RenderPluginPanel() {
     if (ImGui::Button("##lang", ImVec2(btnSize, btnSize))) {
         g_lang = (g_lang == LANG_ZH) ? LANG_EN : LANG_ZH;
         BroadcastLanguage(g_lang == LANG_ZH ? "zh" : "en");
+        SaveAllConfig();
     }
     ImGui::PopStyleColor(3);
     ImGui::PopStyleVar();
@@ -552,6 +569,7 @@ static void RenderPluginPanel() {
             ImGui::SameLine(ImGui::GetContentRegionAvail().x - 110);
             ImGui::Checkbox(T(S_LOAD), &p.enabled);
             if (p.enabled != wasEnabled) {
+                SaveAllConfig();
                 ImGui::SameLine();
                 ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), T(S_RESTART_NEEDED));
             }
@@ -738,11 +756,13 @@ static void RenderPluginPanel() {
                 bool hideUid = g_uidHidden;
                 if (ImGui::Checkbox(T(S_UID_HIDE), &hideUid)) {
                     SetUidVisible(!hideUid);
+                    SaveAllConfig();
                 }
                 ImGui::SameLine();
                 bool hidePing = g_pingHidden;
                 if (ImGui::Checkbox(T(S_PING_HIDE), &hidePing)) {
                     SetPingVisible(!hidePing);
+                    SaveAllConfig();
                 }
                 ImGui::PopID();
 
@@ -753,11 +773,13 @@ static void RenderPluginPanel() {
                 bool hideMenuUid = g_menuUidHidden;
                 if (ImGui::Checkbox(T(S_MENU_UID_HIDE), &hideMenuUid)) {
                     SetMenuUidVisible(!hideMenuUid);
+                    SaveAllConfig();
                 }
                 ImGui::SameLine();
                 bool hideMenuName = g_menuNameHidden;
                 if (ImGui::Checkbox(T(S_MENU_NAME_HIDE), &hideMenuName)) {
                     SetMenuNameVisible(!hideMenuName);
+                    SaveAllConfig();
                 }
                 ImGui::PopID();
 
@@ -768,11 +790,13 @@ static void RenderPluginPanel() {
                 bool hideCardUid = g_cardUidHidden;
                 if (ImGui::Checkbox(T(S_CARD_UID_HIDE), &hideCardUid)) {
                     SetCardUidVisible(!hideCardUid);
+                    SaveAllConfig();
                 }
                 ImGui::SameLine();
                 bool hideCardName = g_cardNameHidden;
                 if (ImGui::Checkbox(T(S_CARD_NAME_HIDE), &hideCardName)) {
                     SetCardNameVisible(!hideCardName);
+                    SaveAllConfig();
                 }
                 ImGui::PopID();
             }
@@ -781,12 +805,7 @@ static void RenderPluginPanel() {
 
     ImGui::Separator();
 
-    // Save
-    if (ImGui::Button(T(S_SAVE_CONFIG), ImVec2(120, 0))) {
-        extern ConfigFile g_managerConfig;
-        SavePluginStates(g_managerConfig);
-    }
-    ImGui::SameLine();
+    // Hint
     ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
                        T(S_LOAD_RESTART));
 
@@ -799,6 +818,8 @@ static void RenderPluginPanel() {
 // ============================================================================
 
 static volatile bool g_overlayRunning = true;
+static WNDPROC g_origGameWndProc = nullptr;
+extern volatile bool g_hotkeyRunning;
 
 static DWORD WINAPI OverlayThread(LPVOID) {
     Log("[AM] Overlay thread started");
@@ -809,6 +830,22 @@ static DWORD WINAPI OverlayThread(LPVOID) {
         if (!g_gameHwnd) Sleep(200);
     }
     Log("[AM] Game window found: 0x%p (pid=%lu)", g_gameHwnd, GetCurrentProcessId());
+
+    // Subclass game window to detect Alt+F4 (WM_CLOSE) before Unity cleanup
+    // This sets g_hookDisabled BEFORE Unity calls set_text during teardown
+    g_origGameWndProc = (WNDPROC)SetWindowLongPtrW(g_gameHwnd, GWLP_WNDPROC,
+        (LONG_PTR)+[](HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) -> LRESULT {
+            if (msg == WM_CLOSE || msg == WM_DESTROY) {
+                g_hookDisabled = true;   // Kill hook BEFORE Unity cleanup starts
+                g_overlayRunning = false;
+                g_hotkeyRunning = false;
+            }
+            return CallWindowProcW(g_origGameWndProc, hwnd, msg, wParam, lParam);
+        });
+    if (g_origGameWndProc)
+        Log("[AM] Game window subclassed for shutdown detection");
+    else
+        Log("[AM] WARNING: Failed to subclass game window");
 
     // Position: top-right of game window
     RECT gr;
@@ -960,7 +997,9 @@ static DWORD WINAPI OverlayThread(LPVOID) {
         // Always check game window first — even when hidden
         if (!IsWindow(g_gameHwnd)) {
             Log("[AM] Game window gone, stopping");
+            g_hookDisabled = true;  // Kill hook IMMEDIATELY — don't wait for DLL_PROCESS_DETACH
             g_overlayRunning = false;
+            g_hotkeyRunning = false;
             break;
         }
 
@@ -968,6 +1007,7 @@ static DWORD WINAPI OverlayThread(LPVOID) {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
             if (msg.message == WM_QUIT) {
+                g_hookDisabled = true;
                 g_overlayRunning = false;
                 break;
             }
@@ -1037,21 +1077,10 @@ static DWORD WINAPI OverlayThread(LPVOID) {
         }
     }
 
-    // Cleanup — guard with __try since game may already be tearing down
-    Log("[AM] Shutting down overlay...");
-    __try {
-        ImGui_ImplDX11_Shutdown();
-        ImGui_ImplWin32_Shutdown();
-        ImGui::DestroyContext();
-        CleanupOverlayDeviceD3D();
-        if (g_overlayHwnd && IsWindow(g_overlayHwnd)) {
-            DestroyWindow(g_overlayHwnd);
-        }
-        g_overlayHwnd = nullptr;
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        // Swallow — process is shutting down, nothing we can do
-    }
-
-    Log("[AM] Overlay thread exited cleanly");
+    // Skip ALL cleanup during shutdown.
+    // COM Release() on DXGI/DComp objects can trigger DCOM/RPC cleanup
+    // with a ~10 second timeout when the RPC server is already torn down.
+    // The OS reclaims all resources on process exit anyway.
+    Log("[AM] Overlay thread exited (cleanup skipped — process shutting down)");
     return 0;
 }
