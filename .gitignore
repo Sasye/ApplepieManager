@@ -1,0 +1,11 @@
+bin/
+*.obj
+*.exp
+*.lib
+*.res
+*.pdb
+*.ilk
+
+!deps/**/*.lib
+!deps/**/*.dll
+!deps/**/*.pdb

@@ -1,0 +1,18 @@
+# Endfield Plugin Manager Configuration / 插件管理器配置
+# 放在游戏根目录 plugin\ 子目录下
+
+# 管理器面板开关键
+toggle_key=HOME
+
+# 调试日志 (1=启用, 0=禁用)
+debug_log=1
+
+# ============================================
+# 插件启用状态 (1=启用, 0=禁用)
+# 未列出的新发现 DLL 默认启用
+# ============================================
+[plugins]
+anti_afk.dll=1
+eiem.dll=1
+EndfieldCombatHUD.dll=1
+synchro_focus.dll=1
