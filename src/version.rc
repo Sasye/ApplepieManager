@@ -23,10 +23,11 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "CompanyName", "Endfield Modding"
+            VALUE "CompanyName", "ApplepieManager"
             VALUE "FileDescription", "Applepie Manager"
             VALUE "FileVersion", "0.1.0"
             VALUE "InternalName", "applepie_manager"
+            VALUE "LegalCopyright",   "AGPL-3.0"
             VALUE "OriginalFilename", "applepie_manager.dll"
             VALUE "ProductName", "Applepie Manager"
             VALUE "ProductVersion", "0.1.0"
