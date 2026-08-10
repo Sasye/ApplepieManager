@@ -87,23 +87,30 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
 // Main Initialization Thread
 // ============================================================================
 static DWORD WINAPI InitThread(LPVOID) {
+    // ── Phase 1: Initialize logging (CriticalSection + CreateFile ≈ 0ms) ──
     InitializeCriticalSection(&g_logLock);
     g_logHandle = CreateFileA("plugin\\applepie_manager_log.txt",
                               GENERIC_WRITE, FILE_SHARE_READ, NULL,
                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     Log("=== Applepie Manager v0.1.0 ===");
 
-    // Load manager config
+    // ── Phase 2: Load plugins ASAP (config read + scan + load ≈ 2-3ms) ──
+    // Matches old proxy timing to avoid IL2CPP GC race.
     g_managerConfig = LoadConfigFile("plugin\\applepie_manager_config.txt");
+
+    ScanPluginDirectory("plugin");
+    if (g_managerConfig.loaded) {
+        ApplyPluginConfig(g_managerConfig);
+    }
+    LoadEnabledPlugins(Log);
+
+    // ── Phase 3: Apply manager settings from config ──
     if (!g_managerConfig.loaded) {
         Log("[AM] Config not found, generating defaults");
         g_managerConfig.filePath = "plugin\\applepie_manager_config.txt";
         g_managerConfig.loaded = true;
 
-        // [general] section
         ConfigSetValue(g_managerConfig, "language", "zh", "general");
-
-        // [uid] section with defaults
         ConfigSetValue(g_managerConfig, "hide_uid",       "1", "uid");
         ConfigSetValue(g_managerConfig, "hide_ping",      "0", "uid");
         ConfigSetValue(g_managerConfig, "hide_menu_uid",  "1", "uid");
@@ -116,11 +123,9 @@ static DWORD WINAPI InitThread(LPVOID) {
     } else {
         Log("[AM] Config loaded");
 
-        // Read language setting
         const char* langVal = ConfigGetValue(g_managerConfig, "language", "general");
         if (langVal && strcmp(langVal, "en") == 0) g_configLang = 1;
 
-        // Apply UID hide settings from config
         g_uidHidden      = ConfigGetBool(g_managerConfig, "hide_uid",       true,  "uid");
         g_pingHidden     = ConfigGetBool(g_managerConfig, "hide_ping",      false, "uid");
         g_menuUidHidden  = ConfigGetBool(g_managerConfig, "hide_menu_uid",  true,  "uid");
@@ -129,20 +134,19 @@ static DWORD WINAPI InitThread(LPVOID) {
         g_cardNameHidden = ConfigGetBool(g_managerConfig, "hide_card_name", true,  "uid");
     }
 
-    // Scan plugin directory
-    ScanPluginDirectory("plugin");
+    // ── Phase 4: Log plugin load results ──
     Log("[AM] Found %d plugins in plugin\\ directory", g_pluginCount);
-
-    // Apply enable/disable from config
-    ApplyPluginConfig(g_managerConfig);
-
-    // Load enabled plugins
-    LoadEnabledPlugins(Log);
-
-    // Log summary
     int loadedCount = 0, interfaceCount = 0;
     for (int i = 0; i < g_pluginCount; i++) {
-        if (g_plugins[i].loaded) loadedCount++;
+        if (g_plugins[i].loaded) {
+            loadedCount++;
+            if (g_plugins[i].hasInterface)
+                Log("[AM] Loaded: %s [%s v%s]", g_plugins[i].dllName,
+                    g_plugins[i].displayName ? g_plugins[i].displayName : "?",
+                    g_plugins[i].version ? g_plugins[i].version : "?");
+            else
+                Log("[AM] Loaded: %s (no standard interface)", g_plugins[i].dllName);
+        }
         if (g_plugins[i].hasInterface) interfaceCount++;
     }
     Log("[AM] Summary: %d/%d loaded, %d with standard interface",
@@ -171,7 +175,6 @@ static DWORD WINAPI InitThread(LPVOID) {
 
     // One-shot: find and hide existing UID text (hook handles future updates)
     CreateThread(NULL, 0, [](LPVOID) -> DWORD {
-        // Wait for game window to actually exist
         HWND wnd = nullptr;
         for (int w = 0; w < 120 && !g_hookDisabled; w++) {
             wnd = FindWindowW(L"UnityWndClass", nullptr);
@@ -180,10 +183,8 @@ static DWORD WINAPI InitThread(LPVOID) {
         }
         if (!wnd || g_hookDisabled) return 0;
 
-        // Retry until UID GO is found or game closes
         int attempt = 0;
         while (IsWindow(wnd) && !g_hookDisabled) {
-            // Sleep in short intervals so we can exit quickly
             for (int s = 0; s < 20 && !g_hookDisabled; s++) Sleep(100);
             if (!IsWindow(wnd) || g_hookDisabled) break;
             __try {
