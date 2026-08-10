@@ -27,16 +27,16 @@
 
 struct AP_PluginInfo {
     int         apiVersion;         // Must be APPLEPIE_PLUGIN_API_VERSION
-    const char* id;                 // Unique identifier: "anti_afk", "eiem", etc.
-    const char* displayName;        // Human-readable: "Anti-AFK 防踢出"
+    const char* id;                 // Unique identifier
+    const char* displayName;        // Human-readable
     const char* description;        // Brief description
     const char* configFile;         // Config filename (relative to plugin\), or nullptr
     bool        supportsHotDisable; // true if runtime pause/resume is supported
 };
 
 struct AP_HotkeyInfo {
-    const char* name;               // Display name: "终结技1"
-    const char* configKey;          // Config file key: "ult_1_key" (nullptr = not configurable)
+    const char* name;               // Display name
+    const char* configKey;          // Config file key: "menuxxx_key" (nullptr = not configurable)
     int         currentVK;          // Current virtual key code
 };
 
