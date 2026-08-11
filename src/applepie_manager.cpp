@@ -87,14 +87,23 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
 // Main Initialization Thread
 // ============================================================================
 static DWORD WINAPI InitThread(LPVOID) {
-    // ── Phase 1: Initialize logging (CriticalSection + CreateFile ≈ 0ms) ──
+    // ── Phase 1: Initialize logging ──
     InitializeCriticalSection(&g_logLock);
     g_logHandle = CreateFileA("plugin\\applepie_manager_log.txt",
                               GENERIC_WRITE, FILE_SHARE_READ, NULL,
                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     Log("=== Applepie Manager v0.1.0 ===");
 
-    // ── Phase 2: Discover plugins (already loaded by proxy) ──
+    // ── Phase 2: Register this thread with GC (MUST be before any IL2CPP interaction) ──
+    InitIL2CppScanner();
+    Log("[AM] IL2CPP: %s", g_il2cppResolved ? "resolved" : "NOT resolved");
+
+    if (g_il2cppResolved) {
+        bool hooked = InstallSetTextHook();
+        Log("[AM] set_text hook: %s", hooked ? "OK" : "FAILED");
+    }
+
+    // ── Phase 3: Discover plugins (already loaded by proxy) ──
     g_managerConfig = LoadConfigFile("plugin\\applepie_manager_config.txt");
 
     ScanPluginDirectory("plugin");
@@ -103,7 +112,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     }
     LoadEnabledPlugins(Log);  // Uses GetModuleHandle, not LoadLibrary
 
-    // ── Phase 3: Apply manager settings from config ──
+    // ── Phase 4: Apply manager settings from config ──
     if (!g_managerConfig.loaded) {
         Log("[AM] Config not found, generating defaults");
         g_managerConfig.filePath = "plugin\\applepie_manager_config.txt";
@@ -133,7 +142,7 @@ static DWORD WINAPI InitThread(LPVOID) {
         g_cardNameHidden = ConfigGetBool(g_managerConfig, "hide_card_name", true,  "uid");
     }
 
-    // ── Phase 4: Log plugin load results ──
+    // ── Phase 5: Log plugin load results ──
     Log("[AM] Found %d plugins in plugin\\ directory", g_pluginCount);
     int loadedCount = 0, interfaceCount = 0;
     for (int i = 0; i < g_pluginCount; i++) {
@@ -154,7 +163,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     // Apply saved language setting
     g_lang = (g_configLang == 1) ? LANG_EN : LANG_ZH;
 
-    // Sync initial language to all plugins
+    // Sync initial language to all plugins (safe — this thread is GC-registered)
     BroadcastLanguage(g_lang == LANG_ZH ? "zh" : "en");
 
     // Start hotkey thread
@@ -162,15 +171,6 @@ static DWORD WINAPI InitThread(LPVOID) {
 
     // Start overlay thread (waits for game window internally)
     CreateThread(NULL, 0, OverlayThread, NULL, 0, NULL);
-
-    // Initialize IL2CPP scanner (non-blocking, retries internally)
-    InitIL2CppScanner();
-
-    // Install set_text hook immediately (before game creates any UI)
-    if (g_il2cppResolved) {
-        bool hooked = InstallSetTextHook();
-        Log("[AM] set_text hook: %s", hooked ? "OK" : "FAILED");
-    }
 
     // One-shot: find and hide existing UID text (hook handles future updates)
     CreateThread(NULL, 0, [](LPVOID) -> DWORD {
