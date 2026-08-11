@@ -130,16 +130,42 @@ static bool IsPluginDisabled(const char* dllName) {
 
 // --- Payload ---
 void LoadPlugin() {
-  // Load plugin DLLs — same timing as old proxy (prevents GC race)
-  // Disabled plugins (per config) are skipped
+  // Wait for IL2CPP to be fully initialized (GC ready)
+  // This prevents "Collecting from unknown thread" and
+  // "Threads explicit registering is not previously enabled" fatal GC errors
+  typedef void* (*il2cpp_domain_get_t)();
+  typedef void* (*il2cpp_thread_attach_t)(void*);
+  il2cpp_domain_get_t p_domain_get = NULL;
+  il2cpp_thread_attach_t p_thread_attach = NULL;
+  HMODULE hGA = NULL;
+  void* dom = NULL;
+
+  for (int i = 0; i < 120; i++) {
+    if (!hGA) {
+      hGA = GetModuleHandleA("GameAssembly.dll");
+      if (hGA) {
+        p_domain_get = (il2cpp_domain_get_t)GetProcAddress(hGA, "il2cpp_domain_get");
+        p_thread_attach = (il2cpp_thread_attach_t)GetProcAddress(hGA, "il2cpp_thread_attach");
+      }
+    }
+    if (p_domain_get) {
+      dom = p_domain_get();
+      if (dom) break;
+    }
+    Sleep(500);
+  }
+
+  // Register this thread with GC so plugin DllMain code is safe
+  if (dom && p_thread_attach) {
+    p_thread_attach(dom);
+  }
+
+  // Load plugin DLLs — disabled plugins (per config) are skipped
   WIN32_FIND_DATAA fd;
   HANDLE hFind = FindFirstFileA("plugin\\*.dll", &fd);
   if (hFind != INVALID_HANDLE_VALUE) {
     do {
-      // Skip the manager itself — load it LAST
       if (_stricmp(fd.cFileName, "applepie_manager.dll") == 0) continue;
-
-      // Skip disabled plugins
       if (IsPluginDisabled(fd.cFileName)) continue;
 
       char path[MAX_PATH];
