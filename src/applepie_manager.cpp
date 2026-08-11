@@ -94,15 +94,14 @@ static DWORD WINAPI InitThread(LPVOID) {
                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     Log("=== Applepie Manager v0.1.0 ===");
 
-    // ── Phase 2: Load plugins ASAP (config read + scan + load ≈ 2-3ms) ──
-    // Matches old proxy timing to avoid IL2CPP GC race.
+    // ── Phase 2: Discover plugins (already loaded by proxy) ──
     g_managerConfig = LoadConfigFile("plugin\\applepie_manager_config.txt");
 
     ScanPluginDirectory("plugin");
     if (g_managerConfig.loaded) {
         ApplyPluginConfig(g_managerConfig);
     }
-    LoadEnabledPlugins(Log);
+    LoadEnabledPlugins(Log);  // Uses GetModuleHandle, not LoadLibrary
 
     // ── Phase 3: Apply manager settings from config ──
     if (!g_managerConfig.loaded) {

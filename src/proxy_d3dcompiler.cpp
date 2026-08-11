@@ -85,23 +85,72 @@
     linker,                                                                    \
     "/export:DebugSetMute=C:\\Windows\\System32\\d3dcompiler_47.DebugSetMute")
 
+// Check if a plugin is disabled in manager config
+static bool IsPluginDisabled(const char* dllName) {
+  // Read config file for disable entries
+  // Format: [plugins] section with dllname=0
+  FILE* f = fopen("plugin\\applepie_manager_config.txt", "r");
+  if (!f) return false;  // No config = all enabled
+
+  bool inPluginsSection = false;
+  char line[512];
+  while (fgets(line, sizeof(line), f)) {
+    // Trim trailing whitespace
+    char* end = line + strlen(line) - 1;
+    while (end > line && (*end == '\n' || *end == '\r' || *end == ' ')) *end-- = 0;
+
+    if (line[0] == '[') {
+      inPluginsSection = (_stricmp(line, "[plugins]") == 0);
+      continue;
+    }
+    if (!inPluginsSection) continue;
+
+    // Parse key=value
+    char* eq = strchr(line, '=');
+    if (!eq) continue;
+    *eq = 0;
+    const char* key = line;
+    const char* val = eq + 1;
+
+    // Trim key
+    char* kend = eq - 1;
+    while (kend > key && *kend == ' ') *kend-- = 0;
+
+    // Skip leading spaces in value
+    while (*val == ' ') val++;
+
+    if (_stricmp(key, dllName) == 0 && strcmp(val, "0") == 0) {
+      fclose(f);
+      return true;
+    }
+  }
+  fclose(f);
+  return false;
+}
+
 // --- Payload ---
 void LoadPlugin() {
-  // Try loading plugin manager first — it will handle loading other plugins
-  HMODULE hMgr = LoadLibraryA("plugin\\applepie_manager.dll");
-  if (hMgr) return; // Manager takes over plugin loading
-
-  // Fallback: no manager found, load all DLLs directly (backward compatible)
+  // Load plugin DLLs — same timing as old proxy (prevents GC race)
+  // Disabled plugins (per config) are skipped
   WIN32_FIND_DATAA fd;
   HANDLE hFind = FindFirstFileA("plugin\\*.dll", &fd);
   if (hFind != INVALID_HANDLE_VALUE) {
     do {
+      // Skip the manager itself — load it LAST
+      if (_stricmp(fd.cFileName, "applepie_manager.dll") == 0) continue;
+
+      // Skip disabled plugins
+      if (IsPluginDisabled(fd.cFileName)) continue;
+
       char path[MAX_PATH];
       snprintf(path, MAX_PATH, "plugin\\%s", fd.cFileName);
       LoadLibraryA(path);
     } while (FindNextFileA(hFind, &fd));
     FindClose(hFind);
   }
+
+  // Load manager AFTER all plugins
+  LoadLibraryA("plugin\\applepie_manager.dll");
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {

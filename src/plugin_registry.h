@@ -180,38 +180,40 @@ static void ApplyPluginConfig(const ConfigFile& cfg) {
 }
 
 // ============================================================================
-// Load enabled plugins
+// Discover plugins already loaded by proxy (via GetModuleHandle, not LoadLibrary)
 // ============================================================================
 
 static void LoadEnabledPlugins(void (*logFn)(const char*, ...) = nullptr) {
     for (int i = 0; i < g_pluginCount; i++) {
         ManagedPlugin& p = g_plugins[i];
 
-        if (!p.enabled) {
-            p.loaded = false;
-            p.active = false;
-            if (logFn) logFn("[AM] Skipped (disabled): %s", p.dllName);
-            continue;
+        // Check if already loaded by proxy
+        p.hModule = GetModuleHandleA(p.dllPath);
+        if (!p.hModule) {
+            // Try just the filename (proxy may have loaded with relative path)
+            p.hModule = GetModuleHandleA(p.dllName);
         }
 
-        p.hModule = LoadLibraryA(p.dllPath);
         if (p.hModule) {
             p.loaded = true;
-            p.active = true;
+            p.active = p.enabled;
             ResolvePluginInterface(p);
             if (logFn) {
                 if (p.hasInterface) {
-                    logFn("[AM] Loaded: %s [%s v%s]",
+                    logFn("[AM] Found: %s [%s v%s]%s",
                           p.dllName, p.displayName ? p.displayName : "?",
-                          p.version ? p.version : "?");
+                          p.version ? p.version : "?",
+                          p.enabled ? "" : " (disabled in config)");
                 } else {
-                    logFn("[AM] Loaded: %s (no standard interface)", p.dllName);
+                    logFn("[AM] Found: %s (no standard interface)%s",
+                          p.dllName,
+                          p.enabled ? "" : " (disabled in config)");
                 }
             }
         } else {
             p.loaded = false;
             p.active = false;
-            if (logFn) logFn("[AM] FAILED to load: %s (err=%lu)", p.dllName, GetLastError());
+            if (logFn) logFn("[AM] Not loaded: %s", p.dllName);
         }
     }
 }
