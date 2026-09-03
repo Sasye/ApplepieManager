@@ -36,6 +36,8 @@ IL2CPP_DECL(void*,  il2cpp_runtime_invoke, void*, void*, void**, void**);
 IL2CPP_DECL(void*,  il2cpp_type_get_object, void*);
 IL2CPP_DECL(void*,  il2cpp_class_get_type, void*);
 IL2CPP_DECL(void*,  il2cpp_string_new, const char*);
+IL2CPP_DECL(uint32_t, il2cpp_gchandle_new, void*, int);
+IL2CPP_DECL(void,     il2cpp_gchandle_free, uint32_t);
 
 #undef IL2CPP_DECL
 
@@ -136,6 +138,8 @@ static bool ResolveIL2Cpp() {
     R(il2cpp_type_get_object);
     R(il2cpp_class_get_type);
     R(il2cpp_string_new);
+    R(il2cpp_gchandle_new);
+    R(il2cpp_gchandle_free);
 #undef R
 
     return p_il2cpp_domain_get && p_il2cpp_runtime_invoke &&
@@ -143,21 +147,24 @@ static bool ResolveIL2Cpp() {
 }
 
 static bool InitIL2CppScanner() {
-    for (int i = 0; i < 60; i++) {
-        if (ResolveIL2Cpp()) {
-            Log("[AM-IL2CPP] Resolved after %d seconds", i + 1);
+    for (int i = 0; i < 120; i++) {
+        // Wait for Unity window to ensure Unity engine & GC_allow_register_threads have completed
+        if (FindWindowW(L"UnityWndClass", nullptr) && ResolveIL2Cpp()) {
+            Log("[AM-IL2CPP] Resolved after %d attempts", i + 1);
             break;
         }
-        Sleep(1000);
+        Sleep(500);
     }
-    if (!g_hGameAssembly) {
+    if (!g_hGameAssembly || !p_il2cpp_domain_get) {
         Log("[AM-IL2CPP] Failed to resolve GameAssembly.dll");
         return false;
     }
 
     void* dom = p_il2cpp_domain_get();
     if (!dom) { Log("[AM-IL2CPP] domain_get failed"); return false; }
-    p_il2cpp_thread_attach(dom);
+    if (p_il2cpp_thread_attach) {
+        p_il2cpp_thread_attach(dom);
+    }
 
     size_t asmCount = 0;
     void** asms = p_il2cpp_domain_get_assemblies(dom, &asmCount);
@@ -457,6 +464,9 @@ static bool InstallSetTextHook() {
         g_nativeGetParent = (tNativeGetParent)((MInfo*)g_methodTransformGetParent)->mp;
 
     g_cachedEmptyStr = p_il2cpp_string_new("");
+    if (g_cachedEmptyStr && p_il2cpp_gchandle_new) {
+        p_il2cpp_gchandle_new(g_cachedEmptyStr, 1); // 1 = pinned GC handle
+    }
 
     void* mp = ((MInfo*)g_methodSetText)->mp;
     if (!mp) return false;

@@ -738,6 +738,10 @@ static void RenderPluginPanel() {
                 if (!s_locateStarted) {
                     s_locateStarted = true;
                     CreateThread(NULL, 0, [](LPVOID) -> DWORD {
+                        void* dom = p_il2cpp_domain_get ? p_il2cpp_domain_get() : nullptr;
+                        if (dom && p_il2cpp_thread_attach) {
+                            p_il2cpp_thread_attach(dom);
+                        }
                         for (int attempt = 0; attempt < 10; attempt++) {
                             if (FindUidComponent()) break;
                             if (g_gameHwnd && !IsWindow(g_gameHwnd)) break;

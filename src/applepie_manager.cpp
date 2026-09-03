@@ -182,6 +182,19 @@ static DWORD WINAPI InitThread(LPVOID) {
         }
         if (!wnd || g_hookDisabled) return 0;
 
+        // Wait for scanner to be resolved
+        for (int w = 0; w < 60 && !g_hookDisabled; w++) {
+            if (g_il2cppResolved) break;
+            Sleep(500);
+        }
+        if (!g_il2cppResolved || g_hookDisabled) return 0;
+
+        // Register this thread with GC before invoking any IL2CPP APIs
+        void* dom = p_il2cpp_domain_get ? p_il2cpp_domain_get() : nullptr;
+        if (dom && p_il2cpp_thread_attach) {
+            p_il2cpp_thread_attach(dom);
+        }
+
         int attempt = 0;
         while (IsWindow(wnd) && !g_hookDisabled) {
             for (int s = 0; s < 20 && !g_hookDisabled; s++) Sleep(100);
