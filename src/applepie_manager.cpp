@@ -92,7 +92,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     g_logHandle = CreateFileA("plugin\\applepie_manager_log.txt",
                               GENERIC_WRITE, FILE_SHARE_READ, NULL,
                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    Log("=== Applepie Manager v0.1.0 ===");
+    Log("=== Applepie Manager ===");
 
     // ── Phase 2: Register this thread with GC (MUST be before any IL2CPP interaction) ──
     InitIL2CppScanner();

@@ -442,7 +442,7 @@ static void RenderPluginPanel() {
     dl->AddText(ImVec2(winPos.x + 14, winPos.y + 9), IM_COL32(60, 180, 220, 255),
                 "Applepie Manager");
     dl->AddText(ImVec2(winPos.x + 195, winPos.y + 9),
-                IM_COL32(100, 100, 105, 200), "v0.1.0");
+                IM_COL32(100, 100, 105, 200), "v0.1.2");
 
     // ---- Drag zone (title bar, excluding lang+close buttons) ----
     ImGui::SetCursorPos(ImVec2(0, 0));
