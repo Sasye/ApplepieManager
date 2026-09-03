@@ -32,6 +32,8 @@ IL2CPP_DECL(void*,  il2cpp_assembly_get_image, void*);
 IL2CPP_DECL(const char*, il2cpp_image_get_name, void*);
 IL2CPP_DECL(void*,  il2cpp_class_from_name, void*, const char*, const char*);
 IL2CPP_DECL(void*,  il2cpp_class_get_method_from_name, void*, const char*, int);
+IL2CPP_DECL(void*,  il2cpp_class_get_field_from_name, void*, const char*);
+IL2CPP_DECL(size_t, il2cpp_field_get_offset, void*);
 IL2CPP_DECL(void*,  il2cpp_runtime_invoke, void*, void*, void**, void**);
 IL2CPP_DECL(void*,  il2cpp_type_get_object, void*);
 IL2CPP_DECL(void*,  il2cpp_class_get_type, void*);
@@ -60,6 +62,8 @@ static void* g_methodGameObjectFind = nullptr;
 static void* g_classTMP_Text = nullptr;
 static void* g_methodGetText = nullptr;
 static void* g_methodSetText = nullptr;
+static void* g_methodGenerateTextMesh = nullptr;
+static size_t g_fieldOffsetMaxVisibleCharacters = (size_t)-1;
 
 // UID control state
 static void* g_uidPanelGO = nullptr;
@@ -134,6 +138,8 @@ static bool ResolveIL2Cpp() {
     R(il2cpp_image_get_name);
     R(il2cpp_class_from_name);
     R(il2cpp_class_get_method_from_name);
+    R(il2cpp_class_get_field_from_name);
+    R(il2cpp_field_get_offset);
     R(il2cpp_runtime_invoke);
     R(il2cpp_type_get_object);
     R(il2cpp_class_get_type);
@@ -219,8 +225,39 @@ static bool InitIL2CppScanner() {
         g_methodSetText = p_il2cpp_class_get_method_from_name(g_classTMP_Text, "set_text", 1);
         Log("[AM-IL2CPP] TMP_Text: class=%p get_text=%p set_text=%p",
             g_classTMP_Text, g_methodGetText, g_methodSetText);
+
+        if (p_il2cpp_class_get_field_from_name && p_il2cpp_field_get_offset) {
+            __try {
+                void* maxVisibleCharactersField = p_il2cpp_class_get_field_from_name(
+                    g_classTMP_Text, "m_maxVisibleCharacters");
+                if (maxVisibleCharactersField) {
+                    g_fieldOffsetMaxVisibleCharacters =
+                        p_il2cpp_field_get_offset(maxVisibleCharactersField);
+                }
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                g_fieldOffsetMaxVisibleCharacters = (size_t)-1;
+            }
+        }
+        if (g_fieldOffsetMaxVisibleCharacters != (size_t)-1) {
+            Log("[AM-IL2CPP] TMP_Text.m_maxVisibleCharacters field resolved dynamically");
+        }
+        else {
+            Log("[AM-IL2CPP] WARNING: TMP_Text.m_maxVisibleCharacters field not found");
+        }
     } else {
         Log("[AM-IL2CPP] WARNING: TMPro.TMP_Text not found");
+    }
+
+    // Render-stage fallback. UIText inherits TextMeshProUGUI.GenerateTextMesh,
+    // so this fires after late Lua/iFix field binding and before the mesh is
+    // presented on the first frame.
+    void* textMeshProUGUIClass =
+        FindClassInAssemblies(asms, asmCount, "TMPro", "TextMeshProUGUI");
+    if (textMeshProUGUIClass) {
+        g_methodGenerateTextMesh = p_il2cpp_class_get_method_from_name(
+            textMeshProUGUIClass, "GenerateTextMesh", 0);
+        Log("[AM-IL2CPP] TextMeshProUGUI.GenerateTextMesh: %p",
+            g_methodGenerateTextMesh);
     }
 
     g_il2cppResolved = true;
@@ -327,6 +364,7 @@ typedef void* (*tNativeGetName)(void* __this, void* methodInfo);
 typedef void* (*tNativeGetTransform)(void* __this, void* methodInfo);
 typedef void* (*tNativeGetParent)(void* __this, void* methodInfo);
 typedef void (*tTMPSetText)(void* __this, void* value, void* methodInfo);
+typedef void (*tTMPVoidMethod)(void* __this, void* methodInfo);
 
 static tTMPSetText g_origSetText = nullptr;
 static bool g_setTextHooked = false;
@@ -335,10 +373,17 @@ static tNativeGetName      g_nativeGetName = nullptr;
 static tNativeGetTransform g_nativeGetTransform = nullptr;
 static tNativeGetParent    g_nativeGetParent = nullptr;
 static void*          g_cachedEmptyStr = nullptr;
+static tTMPVoidMethod g_origGenerateTextMesh = nullptr;
 
 // Component pointer cache — avoids native calls for known components
-enum HideType { HT_MENU_UID = 0, HT_MENU_NAME, HT_CARD_UID, HT_CARD_NAME };
-struct CachedComp { void* comp; HideType type; };
+enum HideType {
+    HT_MENU_UID = 0,
+    HT_MENU_NAME,
+    HT_CARD_UID,
+    HT_CARD_NAME,
+    HT_WATERMARK_UID
+};
+struct CachedComp { void* comp; HideType type; uint32_t pinnedHandle; };
 static CachedComp g_compCache[16] = {};
 static volatile int g_compCacheCount = 0;
 
@@ -348,19 +393,200 @@ static bool IsHideActive(HideType t) {
         case HT_MENU_NAME: return g_menuNameHidden;
         case HT_CARD_UID:  return g_cardUidHidden;
         case HT_CARD_NAME: return g_cardNameHidden;
+        case HT_WATERMARK_UID: return g_uidHidden;
         default: return false;
     }
 }
 
 static void CacheComp(void* comp, HideType type) {
+    if (!comp) return;
     int n = g_compCacheCount;
     for (int i = 0; i < n; i++) {
         if (g_compCache[i].comp == comp) return;
     }
     if (n < 16) {
+        uint32_t handle = 0;
+        if (p_il2cpp_gchandle_new) {
+            __try {
+                handle = p_il2cpp_gchandle_new(comp, 1);
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                handle = 0;
+            }
+        }
+        if (handle == 0) return;
         g_compCache[n].comp = comp;
         g_compCache[n].type = type;
+        g_compCache[n].pinnedHandle = handle;
         g_compCacheCount = n + 1;
+    }
+}
+
+enum IdentityAncestorFlag {
+    IAF_PERSONAL_INFO = 1 << 0,
+    IAF_WATCH_PANEL   = 1 << 1,
+    IAF_TEXT_NODE     = 1 << 2,
+    IAF_UID_PANEL     = 1 << 3,
+    IAF_PING          = 1 << 4
+};
+
+static unsigned GetIdentityAncestorFlags(void* component) {
+    if (!component || !g_nativeGetTransform || !g_nativeGetParent ||
+        !g_nativeGetName) {
+        return 0;
+    }
+
+    unsigned flags = 0;
+    __try {
+        void* cur = g_nativeGetTransform(component, g_methodComponentGetTransform);
+        for (int level = 0; cur && level < 16; level++) {
+            cur = g_nativeGetParent(cur, g_methodTransformGetParent);
+            if (!cur) break;
+
+            void* nameStr = g_nativeGetName(cur, g_methodTransformGetName);
+            if (!nameStr) continue;
+            char name[48];
+            if (ReadIL2CppString(nameStr, name, sizeof(name)) <= 0) continue;
+
+            if (strcmp(name, "PersonalInfoNode") == 0)
+                flags |= IAF_PERSONAL_INFO;
+            else if (strcmp(name, "WatchPanel") == 0)
+                flags |= IAF_WATCH_PANEL;
+            else if (strcmp(name, "TextNode") == 0)
+                flags |= IAF_TEXT_NODE;
+            else if (strcmp(name, "UIDPanelPanel") == 0)
+                flags |= IAF_UID_PANEL;
+            else if (strcmp(name, "PingCon") == 0)
+                flags |= IAF_PING;
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    return flags;
+}
+
+static bool ShouldSuppressIdentityMesh(void* component) {
+    if (!component || g_hookDisabled) return false;
+
+    int n = g_compCacheCount;
+    for (int i = 0; i < n; i++) {
+        if (g_compCache[i].comp == component) {
+            return IsHideActive(g_compCache[i].type);
+        }
+    }
+
+    if (!g_nativeGetGO || !g_nativeGetName) return false;
+    bool anyHidden = g_uidHidden || g_menuUidHidden || g_menuNameHidden ||
+                     g_cardUidHidden || g_cardNameHidden;
+    if (!anyHidden) return false;
+
+    __try {
+        void* go = g_nativeGetGO(component, g_methodComponentGetGameObject);
+        if (!go) return false;
+        void* nameStr = g_nativeGetName(go, g_methodTransformGetName);
+        if (!nameStr) return false;
+
+        char name[64];
+        if (ReadIL2CppString(nameStr, name, sizeof(name)) <= 0) return false;
+
+        if (strcmp(name, "ManagerNumber") == 0) {
+            CacheComp(component, HT_MENU_UID);
+            return g_menuUidHidden;
+        }
+        else if (strcmp(name, "ManagerName") == 0) {
+            CacheComp(component, HT_MENU_NAME);
+            return g_menuNameHidden;
+        }
+        else if (strcmp(name, "PlayerUidTxt") == 0) {
+            CacheComp(component, HT_CARD_UID);
+            return g_cardUidHidden;
+        }
+
+        else if (strcmp(name, "NameText") == 0) {
+            unsigned ancestors = GetIdentityAncestorFlags(component);
+            if (ancestors & IAF_PERSONAL_INFO) {
+                CacheComp(component, HT_CARD_NAME);
+                return g_cardNameHidden;
+            }
+            else if (ancestors & IAF_WATCH_PANEL) {
+                CacheComp(component, HT_MENU_NAME);
+                return g_menuNameHidden;
+            }
+        }
+        else if (strcmp(name, "NameTxt") == 0) {
+            unsigned ancestors = GetIdentityAncestorFlags(component);
+            if (ancestors & IAF_PERSONAL_INFO) {
+                CacheComp(component, HT_CARD_NAME);
+                return g_cardNameHidden;
+            }
+        }
+        else if (strcmp(name, "Text") == 0) {
+            unsigned ancestors = GetIdentityAncestorFlags(component);
+            if ((ancestors & IAF_TEXT_NODE) &&
+                (ancestors & IAF_UID_PANEL) && !(ancestors & IAF_PING)) {
+                CacheComp(component, HT_WATERMARK_UID);
+                return g_uidHidden;
+            }
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return false;
+}
+
+static bool TrySetTemporaryMaxVisibleCharacters(void* component,
+                                                 int value,
+                                                 int* previousValue) {
+    if (!component || !previousValue || g_hookDisabled) return false;
+    if (g_fieldOffsetMaxVisibleCharacters == (size_t)-1) return false;
+
+    __try {
+        int* field = (int*)((char*)component + g_fieldOffsetMaxVisibleCharacters);
+        *previousValue = *field;
+        *field = value;
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static void RestoreMaxVisibleCharacters(void* component, int previousValue) {
+    if (!component) return;
+    if (g_fieldOffsetMaxVisibleCharacters == (size_t)-1) return;
+
+    // This restoration must run even if shutdown begins during GenerateTextMesh.
+    // It performs only a native field write and does not call back into IL2CPP.
+    __try {
+        int* field = (int*)((char*)component + g_fieldOffsetMaxVisibleCharacters);
+        *field = previousValue;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static void hkGenerateTextMesh(void* __this, void* methodInfo) {
+    if (!g_origGenerateTextMesh) return;
+    if (g_hookDisabled) {
+        g_origGenerateTextMesh(__this, methodInfo);
+        return;
+    }
+
+    if (!ShouldSuppressIdentityMesh(__this)) {
+        g_origGenerateTextMesh(__this, methodInfo);
+        return;
+    }
+
+    int previousMaxVisibleCharacters = 0;
+    if (!TrySetTemporaryMaxVisibleCharacters(
+            __this, 0, &previousMaxVisibleCharacters)) {
+        g_origGenerateTextMesh(__this, methodInfo);
+        return;
+    }
+
+    // Let TMP complete its normal render pass with zero visible characters.
+    // Restoring in __finally avoids mutating persistent component state and
+    // guarantees cleanup if the original routine raises an SEH exception.
+    __try {
+        g_origGenerateTextMesh(__this, methodInfo);
+    } __finally {
+        RestoreMaxVisibleCharacters(__this, previousMaxVisibleCharacters);
     }
 }
 
@@ -440,6 +666,23 @@ static void hkTMPSetText(void* __this, void* value, void* methodInfo) {
                                     }
                                 }
                             }
+                            else if (strcmp(name, "NameText") == 0) {
+                                unsigned ancestors = GetIdentityAncestorFlags(__this);
+                                if (ancestors & IAF_PERSONAL_INFO) {
+                                    CacheComp(__this, HT_CARD_NAME);
+                                    if (g_cardNameHidden) {
+                                        g_origSetText(__this, g_cachedEmptyStr, methodInfo);
+                                        return;
+                                    }
+                                }
+                                else if (ancestors & IAF_WATCH_PANEL) {
+                                    CacheComp(__this, HT_MENU_NAME);
+                                    if (g_menuNameHidden) {
+                                        g_origSetText(__this, g_cachedEmptyStr, methodInfo);
+                                        return;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -484,6 +727,34 @@ static bool InstallSetTextHook() {
     g_setTextHooked = true;
     Log("[AM-UID] Hooked TMP_Text.set_text: %p (getGO=%p, getName=%p)",
         mp, g_nativeGetGO, g_nativeGetName);
+
+    if (g_methodGenerateTextMesh &&
+        g_fieldOffsetMaxVisibleCharacters != (size_t)-1) {
+        void* generateMp = ((MInfo*)g_methodGenerateTextMesh)->mp;
+        if (generateMp && generateMp != mp) {
+            MH_STATUS generateCreateStatus = MH_CreateHook(
+                generateMp, (void*)hkGenerateTextMesh,
+                (void**)&g_origGenerateTextMesh);
+            if (generateCreateStatus != MH_OK) {
+                Log("[AM-UID] GenerateTextMesh hook creation failed: %d",
+                    generateCreateStatus);
+            }
+            else {
+                MH_STATUS generateEnableStatus = MH_EnableHook(generateMp);
+                if (generateEnableStatus != MH_OK) {
+                    Log("[AM-UID] GenerateTextMesh hook enable failed: %d",
+                        generateEnableStatus);
+                }
+                else {
+                    Log("[AM-UID] Hooked TextMeshProUGUI.GenerateTextMesh: %p (dynamic visibility field)",
+                        generateMp);
+                }
+            }
+        }
+    }
+    else if (g_methodGenerateTextMesh) {
+        Log("[AM-UID] GenerateTextMesh hook skipped: visibility field unavailable");
+    }
     return true;
 }
 
