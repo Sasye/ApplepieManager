@@ -1,0 +1,4 @@
+interface:
+  display_name: "Applepie 插件迁移"
+  short_description: "迁移旧 DLL 插件到 Applepie SDK，保留特殊 Hook、slot 与热启停行为"
+  default_prompt: "使用 $applepie-plugin-migration 将指定旧插件迁移到当前 Applepie SDK，保留原功能，并完成构建与针对性离线验证。"

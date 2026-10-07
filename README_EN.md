@@ -2,14 +2,19 @@
 
 English | [中文](README.md)
 
-A DLL plugin manager for *Arknights: Endfield*. Provides a unified plugin loading, hotkey management, and configuration interface with multilingual support. Displays a GUI via an independent DX11 overlay window. Includes built-in UID hiding for installation verification, allowing one-click hiding of UIDs and player names from the in-game HUD, menus, and business cards.
+A DLL plugin manager for *Arknights: Endfield*. Manager contains a Core for plugin loading, exclusive and typed shared hooks, managed pointer slots, window routing, asynchronous logical enable/disable and independent animation/camera ownership. It retains the independent DX11 panel and existing UID feature. See the [SDK](sdk/README.md) for plugin integration.
 
 ## Key Features
 
-- **Plugin Management**: Automatically scans DLL plugins in the `plugin\` directory with enable/disable, pause/resume controls and real-time status display
-- **Hotkey Management**: Centralized hotkey overview for all plugins with conflict detection and one-click rebinding
+- **Plugin Management**: Scans after CoreReady, checks new manifests, ABI, duplicate IDs and required capabilities, and distinguishes loaded/attached/active states
+- **Dynamic Hooks**: Exclusive and typed shared targets, two-stage activation, address deduplication, exact native signatures and SEH entry contracts; SDK in `sdk/`
+- **Shared Services**: Conditional PointerPatch restoration, one game-window chain and minimal runtime/target-generation tickets
+- **Lifecycle and Ownership**: Runtime buttons asynchronously load, enable and disable adapted clients; Disabled requires confirmed restoration, Enable grants no animation/camera ownership, and DLLs remain resident
+- **Startup Configuration**: Panel checkboxes apply on the next launch, independently of runtime buttons
 - **UID Hiding**: Hide in-game UID, ping display, menu UID/name, and business card UID/name
-- **Multilingual UI**: One-click Chinese/English toggle that broadcasts the language to all supporting plugins
+- **Multilingual UI**: Chinese/English toggle for the Manager panel
+
+Optional plugin dependencies, versioned synchronous services, detailed errors and bounded log rotation are available in SDK 1.1, which remains compatible with 1.0 plugins. Built-in UID object operations run on the verified game thread. See the [SDK guide](sdk/README.md).
 
 ## User Agreement & Disclaimer
 
@@ -42,7 +47,7 @@ bin/vulkan-1.dll           → Game Directory/vulkan-1.dll
 bin/d3dcompiler_47.dll     → Game Directory/d3dcompiler_47.dll
 ```
 
-> **Note**: `d3dcompiler_47.dll` (DirectX) and `vulkan-1.dll` (Vulkan) are proxy loaders. You only need the one matching your rendering API, or both. If you are also using other plugins that share these proxy loaders, there is no need to overwrite them.
+> `d3dcompiler_47.dll` (DirectX) and `vulkan-1.dll` (Vulkan) only bootstrap Manager. Either or both can be used. Plugins integrate through the SDK; legacy proxies, packages and hosts are not bridged.
 
 > If you have **never installed a plugin of this type before**, you may need to create the `plugin` folder yourself.
 
@@ -50,9 +55,13 @@ bin/d3dcompiler_47.dll     → Game Directory/d3dcompiler_47.dll
 
 1. Launch the game after installing the files as described above.
 2. Press the `HOME` key to open/close the manager panel.
-3. The panel lets you view and manage all loaded plugins, adjust UID hiding options, and rebind hotkeys.
+3. Inspect load/Attach/capability states, set loading for the next launch, and adjust UID hiding options.
 4. Click the language toggle button to switch languages.
 
 ## Plugin Development
 
-If you want to develop plugins that integrate with Applepie Manager, see the [Plugin Development Guide (applepie.md)](applepie.md).
+Plugins can use the optional [C++ client](sdk/applepie_client.h) and [Endfield shared adapters](sdk/applepie_endfield_adapters.h); the [C API](sdk/applepie.h) remains available. See the [SDK guide](sdk/README.md) for integration and a complete example. Run `sdk\examples\build.bat` to build the minimal plugin, or add `/verify` for standalone offline checks. Neither command launches or deploys to the game.
+
+For existing plugins, use the [Applepie plugin migration skill](skills/applepie-plugin-migration/SKILL.md) with your coding agent. It selects the required integration paths while preserving custom hooks, pointer-slot wrappers and business restoration.
+
+Install the Visual Studio C++ desktop workload, then run `build.bat` from the project root. The production build generates `bin/applepie_manager.dll`, `bin/d3dcompiler_47.dll` and `bin/vulkan-1.dll`.

@@ -1,4 +1,5 @@
 #pragma once
+#include "hub_internal.h"
 // ============================================================================
 // imgui_panel.h — ImGui overlay panel for Applepie Manager
 // ============================================================================
@@ -442,7 +443,7 @@ static void RenderPluginPanel() {
     dl->AddText(ImVec2(winPos.x + 14, winPos.y + 9), IM_COL32(60, 180, 220, 255),
                 "Applepie Manager");
     dl->AddText(ImVec2(winPos.x + 195, winPos.y + 9),
-                IM_COL32(100, 100, 105, 200), "v0.1.2");
+                IM_COL32(100, 100, 105, 200), "v0.2.0");
 
     // ---- Drag zone (title bar, excluding lang+close buttons) ----
     ImGui::SetCursorPos(ImVec2(0, 0));
@@ -479,7 +480,7 @@ static void RenderPluginPanel() {
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(100, 105, 120, 255));
     if (ImGui::Button("##lang", ImVec2(btnSize, btnSize))) {
         g_lang = (g_lang == LANG_ZH) ? LANG_EN : LANG_ZH;
-        BroadcastLanguage(g_lang == LANG_ZH ? "zh" : "en");
+
         SaveAllConfig();
     }
     ImGui::PopStyleColor(3);
@@ -528,231 +529,59 @@ static void RenderPluginPanel() {
     ImGui::BeginChild("##content", ImVec2(winSize.x - 24, contentH), false,
                       ImGuiWindowFlags_AlwaysVerticalScrollbar);
 
-    // Plugin list
-    for (int i = 0; i < g_pluginCount; i++) {
-        ManagedPlugin& p = g_plugins[i];
-        ImGui::PushID(i);
-
-        // Status indicator
-        ImVec4 statusColor;
-        const char* statusText;
-        if (!p.loaded) {
-            statusColor = ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
-            statusText = T(S_STATUS_DISABLED);
-        } else if (p.active) {
-            statusColor = ImVec4(0.2f, 0.9f, 0.3f, 1.0f);
-            statusText = T(S_STATUS_ACTIVE);
-        } else {
-            statusColor = ImVec4(0.95f, 0.75f, 0.1f, 1.0f);
-            statusText = T(S_STATUS_PAUSED);
-        }
-
-        ImGui::PushStyleColor(ImGuiCol_Text, statusColor);
-        ImGui::BulletText("%s", statusText);
-        ImGui::PopStyleColor();
-
-        ImGui::SameLine();
-        const char* name = p.hasInterface && p.displayName ? p.displayName : p.dllName;
-        if (p.version && p.version[0]) {
-            ImGui::Text("%s v%s", name, p.version);
-        } else {
-            ImGui::Text("%s", name);
-        }
-
-        if (p.hasInterface && p.description && ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("%s", p.description);
-        }
-
-        // Boot enable/disable
-        {
-            bool wasEnabled = p.enabled;
-            ImGui::SameLine(ImGui::GetContentRegionAvail().x - 110);
-            ImGui::Checkbox(T(S_LOAD), &p.enabled);
-            if (p.enabled != wasEnabled) {
-                SaveAllConfig();
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), T(S_RESTART_NEEDED));
-            }
-        }
-
-        // Runtime pause/resume
-        if (p.loaded && p.supportsHotDisable) {
-            ImGui::SameLine(ImGui::GetContentRegionAvail().x - 30);
-            if (p.active) {
-                if (ImGui::SmallButton(T(S_PAUSE))) TogglePluginActive(i);
-            } else {
-                if (ImGui::SmallButton(T(S_RESUME))) TogglePluginActive(i);
-            }
-        }
-
-        // Config editor
-        if (p.hasInterface && p.configFile) {
-            char configPath[MAX_PATH];
-            snprintf(configPath, MAX_PATH, "plugin\\%s", p.configFile);
-            if (ImGui::TreeNode(T(S_SETTINGS))) {
-                auto entries = ReadPluginConfig(configPath);
-                bool configChanged = false;
-                for (auto& e : entries) {
-                    if (e.key == "enabled") continue;
-                    // Skip hotkey config keys — already shown in Hotkeys section
-                    bool isHotkeyKey = false;
-                    for (int hk = 0; hk < p.hotkeyCount; hk++) {
-                        if (p.hotkeys[hk].configKey && e.key == p.hotkeys[hk].configKey) {
-                            isHotkeyKey = true;
-                            break;
-                        }
-                    }
-                    if (isHotkeyKey) continue;
-                    char valBuf[256];
-                    strncpy(valBuf, e.value.c_str(), sizeof(valBuf) - 1);
-                    valBuf[sizeof(valBuf) - 1] = '\0';
-                    ImGui::SetNextItemWidth(120);
-                    if (ImGui::InputText(e.key.c_str(), valBuf, sizeof(valBuf),
-                                         ImGuiInputTextFlags_EnterReturnsTrue)) {
-                        UpdatePluginConfigValue(configPath, e.key.c_str(), valBuf);
-                        configChanged = true;
-                    }
-                }
-                if (configChanged && p.pfnReloadConfig) ReloadPluginConfig(i);
-                ImGui::TreePop();
-            }
-        } else if (!p.hasInterface) {
-            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f),
-                               T(S_NO_INTERFACE));
-        }
-
-        // Hotkeys with rebind
-        if (p.hotkeyCount > 0 && ImGui::TreeNode(T(S_HOTKEYS))) {
-            for (int h = 0; h < p.hotkeyCount; h++) {
-                ImGui::PushID(h);
-                ImGui::Text("  %s", p.hotkeys[h].name);
-                ImGui::SameLine(180);
-                ImGui::TextColored(ImVec4(0.24f, 0.71f, 0.86f, 1.0f),
-                                   "[%s]", VKToName(p.hotkeys[h].currentVK));
-
-                // Rebind button (only if configKey is set)
-                if (p.hotkeys[h].configKey) {
-                    ImGui::SameLine();
-
-                    // State for this specific hotkey rebind
-                    static int s_rebindPlugin = -1;
-                    static int s_rebindHotkey = -1;
-                    bool isRebinding = (s_rebindPlugin == i && s_rebindHotkey == h);
-
-                    if (isRebinding) {
-                        // Show prompt
-                        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f),
-                                           "%s %s", T(S_REBIND_PROMPT), T(S_REBIND_CANCEL));
-
-                        // Scan for key press
-                        bool captured = false;
-                        for (int vk = 1; vk < 256; vk++) {
-                            // Skip mouse buttons and modifier-only keys
-                            if (vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON) continue;
-                            if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU) continue;
-                            if (vk == VK_LSHIFT || vk == VK_RSHIFT) continue;
-                            if (vk == VK_LCONTROL || vk == VK_RCONTROL) continue;
-                            if (vk == VK_LMENU || vk == VK_RMENU) continue;
-
-                            if (GetAsyncKeyState(vk) & 1) {
-                                if (vk == VK_ESCAPE) {
-                                    // Cancel
-                                    s_rebindPlugin = -1;
-                                    s_rebindHotkey = -1;
-                                    captured = true;
-                                    break;
-                                }
-                                // Apply new key — write as decimal VK code
-                                // Plugins parse via ParseVK() which supports
-                                // decimal (112), hex (0x70), and single char (Q)
-                                char vkStr[16];
-                                snprintf(vkStr, sizeof(vkStr), "%d", vk);
-                                char configPath[MAX_PATH];
-                                snprintf(configPath, MAX_PATH, "plugin\\%s", p.configFile);
-                                UpdatePluginConfigValue(configPath, p.hotkeys[h].configKey, vkStr);
-                                if (p.pfnReloadConfig) ReloadPluginConfig(i);
-                                Log("[AM] Rebound %s.%s -> %s (0x%02X)",
-                                    p.dllName, p.hotkeys[h].configKey, VKToName(vk), vk);
-                                s_rebindPlugin = -1;
-                                s_rebindHotkey = -1;
-                                captured = true;
-                                break;
-                            }
-                        }
-                    } else {
-                        if (ImGui::SmallButton(T(S_REBIND))) {
-                            s_rebindPlugin = i;
-                            s_rebindHotkey = h;
-                        }
-                    }
-                }
-                ImGui::PopID();
-            }
+    // Core/loader own asynchronous lifecycle truth; UI only submits requests.
+    for (unsigned i = 0; i < loader::count(); ++i) {
+        loader::Plugin p{};
+        if (!loader::snapshot(i, &p)) continue;
+        ImGui::PushID((int)i);
+        char filename[MAX_PATH * 3];
+        WideCharToMultiByte(CP_UTF8, 0, p.filename, -1, filename, sizeof(filename), nullptr, nullptr);
+        ImGui::Text("%s", p.manifest.display_name[0] ? p.manifest.display_name : filename);
+        if(p.owner)ImGui::TextDisabled("%s / owner=%llu",p.manifest.id,p.owner);
+        ImGui::TextColored(p.state == loader::Active ? ImVec4(0.2f,0.9f,0.3f,1) : ImVec4(0.95f,0.75f,0.1f,1),
+                           "%s / %s (%d)", loader::state_name(p.state), APH_ResultName(p.result), p.result);
+        if(p.detail[0])ImGui::TextWrapped("%s: %s (Win32=%u)",p.stage,p.detail,p.win32_error);
+        APH_ErrorDetail detail{};
+        APH_OwnerStatus fault{};
+        if(p.owner&&hub::api()->owner_status(p.owner,sizeof(fault),&fault)==APH_OK&&fault.fault_code&&ImGui::TreeNode("Fault details")) {
+            ImGui::Text("Code: 0x%08X / Address: %p\nHook: %llu / Phase: %u / Thread: %u",
+                fault.fault_code,(void*)fault.fault_address,fault.fault_hook,fault.fault_phase,fault.fault_thread);
             ImGui::TreePop();
         }
-
-        ImGui::Spacing();
+        if(p.owner&&hub::services::diagnostics_api()->last_error(p.owner,sizeof(detail),&detail)==APH_OK&&ImGui::TreeNode("Last error")) {
+            ImGui::TextWrapped("%s: %s (%d)\nResource: %s\nTarget: %p / Hook: %llu\nBackend: %u / Win32: %u\n%s",
+                detail.operation,APH_ResultName(detail.result),detail.result,detail.resource,(void*)detail.target,
+                detail.hook,detail.backend_status,detail.win32_error,detail.message);
+            ImGui::TreePop();
+        }
+        ImGui::TextDisabled("Loaded: %s / Attached: %s / Capabilities: %s",
+                            p.loaded ? "yes" : "no", p.attached ? "yes" : "no", p.capabilities_ready ? "ready" : "waiting");
+        if (ImGui::Checkbox(T(S_LOAD), &g_pluginEnabled[i])) SaveAllConfig();
+        ImGui::SameLine(); ImGui::TextDisabled("%s", T(S_RESTART_NEEDED));
+        if(p.state==loader::Enabling&&(p.manifest.flags&APH_PLUGIN_LIFECYCLE)) {
+            if(ImGui::Button(g_lang==LANG_ZH?u8"取消启用":"Cancel enable"))loader::request_enabled(i,false);
+            ImGui::SameLine();ImGui::TextDisabled("%s",g_lang==LANG_ZH?u8"正在准备":"Preparing...");
+        } else if(p.state==loader::Enabling||p.state==loader::Disabling)
+            ImGui::TextDisabled("%s",g_lang==LANG_ZH?u8"正在排空或准备，请稍候":"Draining or preparing...");
+        else if(p.state==loader::Active&&(p.manifest.flags&APH_PLUGIN_LIFECYCLE)) {
+            if(ImGui::Button(g_lang==LANG_ZH?u8"停用":"Disable"))loader::request_enabled(i,false);
+        } else if(p.state==loader::WaitingDependencies) {
+            if(ImGui::Button("Cancel waiting"))loader::request_enabled(i,false);
+        } else if(p.state==loader::Disabled) {
+            if(ImGui::Button(g_lang==LANG_ZH?u8"启用":"Enable"))loader::request_enabled(i,true);
+        }
+        ImGui::Separator();
         ImGui::PopID();
     }
-
-    ImGui::Separator();
-
-    // Hotkey overview
-    if (ImGui::CollapsingHeader(T(S_HOTKEY_OVERVIEW), ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::Text("  %-12s  %s", "HOME", T(S_PLUGIN_MANAGER));
-        for (int i = 0; i < g_pluginCount; i++) {
-            if (!g_plugins[i].loaded || !g_plugins[i].active) continue;
-            const char* name = g_plugins[i].hasInterface && g_plugins[i].displayName
-                ? g_plugins[i].displayName : g_plugins[i].dllName;
-            for (int h = 0; h < g_plugins[i].hotkeyCount; h++) {
-                ImGui::Text("  %-12s  %s - %s",
-                            VKToName(g_plugins[i].hotkeys[h].currentVK),
-                            name, g_plugins[i].hotkeys[h].name);
-            }
-        }
-        auto conflicts = DetectHotkeyConflicts();
-        if (conflicts.empty()) {
-            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.3f, 1.0f), T(S_NO_CONFLICT));
-        } else {
-            for (const auto& c : conflicts) {
-                ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
-                    T(S_CONFLICT_FMT),
-                    VKToName(c.vk),
-                    g_plugins[c.pluginIdx1].displayName ? g_plugins[c.pluginIdx1].displayName : g_plugins[c.pluginIdx1].dllName,
-                    g_plugins[c.pluginIdx2].displayName ? g_plugins[c.pluginIdx2].displayName : g_plugins[c.pluginIdx2].dllName);
-            }
-        }
-    }
-
-    ImGui::Separator();
-
     // ==================== UID Control ====================
     if (ImGui::CollapsingHeader(T(S_UID_CONTROL), ImGuiTreeNodeFlags_DefaultOpen)) {
         if (!g_il2cppResolved) {
             ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f),
                                T(S_IL2CPP_NOT_READY));
         } else {
-            // Auto-locate UID on first render
-            if (!g_uidPanelGO) {
-                static bool s_locateStarted = false;
-                if (!s_locateStarted) {
-                    s_locateStarted = true;
-                    CreateThread(NULL, 0, [](LPVOID) -> DWORD {
-                        void* dom = p_il2cpp_domain_get ? p_il2cpp_domain_get() : nullptr;
-                        if (dom && p_il2cpp_thread_attach) {
-                            p_il2cpp_thread_attach(dom);
-                        }
-                        for (int attempt = 0; attempt < 10; attempt++) {
-                            if (FindUidComponent()) break;
-                            if (g_gameHwnd && !IsWindow(g_gameHwnd)) break;
-                            Sleep(500);
-                        }
-                        return 0;
-                    }, NULL, 0, NULL);
-                }
-                ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f),
-                                   u8"\xe2\x8f\xb3 %s...", T(S_UID_LOCATE));
-            } else {
+            if(!g_uidLocated.load())
+                ImGui::TextDisabled("%s",g_lang==LANG_ZH?u8"等待游戏线程定位 UID 控件，设置将自动应用":"Waiting for UID controls on the game thread; settings will apply automatically");
+            {
                 // In-game section
                 ImGui::PushID("ingame");
                 ImGui::Text("%s:", T(S_UID_INGAME));
@@ -822,8 +651,24 @@ static void RenderPluginPanel() {
 // ============================================================================
 
 static volatile bool g_overlayRunning = true;
-static WNDPROC g_origGameWndProc = nullptr;
+static APH_WindowApi g_managerWindows{};
+static APH_Route g_managerWindowRoute;
+static APH_Owner g_managerUiOwner;
 extern volatile bool g_hotkeyRunning;
+static void APH_CALL ManagerWindowEvent(APH_Owner,const APH_WindowEvent* e,void*) {
+    if(e->phase==APH_WINDOW_AFTER && e->message==WM_NCDESTROY) {
+        StopUidRuntime();g_overlayRunning=false;g_hotkeyRunning=false;
+    }
+}
+static bool InitializeManagerUiOwner() {
+    HMODULE module=nullptr;
+    if(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,(LPCWSTR)InitializeManagerUiOwner,&module))return false;
+    APH_Manifest manifest{sizeof(manifest),1,0,APH_ARCH_X64,0,APH_CAP_CORE,0,"applepie.manager.ui","Manager window"};
+    g_managerUiOwner=hub::add_owner(manifest,module);
+    if(!g_managerUiOwner||hub::api()->copy_service(g_managerUiOwner,APH_SERVICE_WINDOWS,1,sizeof(g_managerWindows),&g_managerWindows)!=APH_OK)return false;
+    if(!hub::begin_enable(g_managerUiOwner))return false;
+    hub::finish_enable(g_managerUiOwner,APH_OK);return true;
+}
 
 static DWORD WINAPI OverlayThread(LPVOID) {
     Log("[AM] Overlay thread started");
@@ -835,21 +680,11 @@ static DWORD WINAPI OverlayThread(LPVOID) {
     }
     Log("[AM] Game window found: 0x%p (pid=%lu)", g_gameHwnd, GetCurrentProcessId());
 
-    // Subclass game window to detect Alt+F4 (WM_CLOSE) before Unity cleanup
-    // This sets g_hookDisabled BEFORE Unity calls set_text during teardown
-    g_origGameWndProc = (WNDPROC)SetWindowLongPtrW(g_gameHwnd, GWLP_WNDPROC,
-        (LONG_PTR)+[](HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) -> LRESULT {
-            if (msg == WM_CLOSE || msg == WM_DESTROY) {
-                g_hookDisabled = true;   // Kill hook BEFORE Unity cleanup starts
-                g_overlayRunning = false;
-                g_hotkeyRunning = false;
-            }
-            return CallWindowProcW(g_origGameWndProc, hwnd, msg, wParam, lParam);
-        });
-    if (g_origGameWndProc)
-        Log("[AM] Game window subclassed for shutdown detection");
-    else
-        Log("[AM] WARNING: Failed to subclass game window");
+    // Core owns the common chain. A cancelled WM_CLOSE is not shutdown.
+    if(g_managerUiOwner && g_managerWindows.subscribe) {
+        APH_WindowRequest request{sizeof(request),APH_RECOVERY_NONE,(uint64_t)(uintptr_t)g_gameHwnd,ManagerWindowEvent,nullptr};
+        Log("[AM] Core window route request=%d",g_managerWindows.subscribe(g_managerUiOwner,&request,&g_managerWindowRoute));
+    }
 
     // Position: top-right of game window
     RECT gr;

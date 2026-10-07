@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <windows.h>
+#include "manager_hooks.h"
 
 // Forward decl
 void Log(const char* fmt, ...);
@@ -23,10 +24,8 @@ void Log(const char* fmt, ...);
 
 #define IL2CPP_DECL(ret, name, ...) \
     typedef ret (*t_##name)(__VA_ARGS__); \
-    static t_##name p_##name = nullptr
+    static UidRuntimeFunction<t_##name> p_##name{}
 
-IL2CPP_DECL(void*,  il2cpp_domain_get);
-IL2CPP_DECL(void*,  il2cpp_thread_attach, void*);
 IL2CPP_DECL(void**, il2cpp_domain_get_assemblies, void*, size_t*);
 IL2CPP_DECL(void*,  il2cpp_assembly_get_image, void*);
 IL2CPP_DECL(const char*, il2cpp_image_get_name, void*);
@@ -40,6 +39,11 @@ IL2CPP_DECL(void*,  il2cpp_class_get_type, void*);
 IL2CPP_DECL(void*,  il2cpp_string_new, const char*);
 IL2CPP_DECL(uint32_t, il2cpp_gchandle_new, void*, int);
 IL2CPP_DECL(void,     il2cpp_gchandle_free, uint32_t);
+IL2CPP_DECL(void*,    il2cpp_gchandle_get_target, uint32_t);
+IL2CPP_DECL(uint32_t, il2cpp_method_get_flags, void*, uint32_t*);
+IL2CPP_DECL(uint32_t, il2cpp_method_get_param_count, void*);
+IL2CPP_DECL(void*, il2cpp_method_get_return_type, void*);
+IL2CPP_DECL(int, il2cpp_type_get_type, void*);
 
 #undef IL2CPP_DECL
 
@@ -47,7 +51,12 @@ IL2CPP_DECL(void,     il2cpp_gchandle_free, uint32_t);
 // State
 // ============================================================================
 
-static bool g_il2cppResolved = false;
+static std::atomic<bool> g_il2cppResolved{false};
+static void* g_methodApplicationQuit=nullptr;
+static void* g_uidSetTextAddress=nullptr;
+static void* g_uidGenerateAddress=nullptr;
+static void* g_uidQuitAddress=nullptr;
+static bool CaptureUidNative();
 static HMODULE g_hGameAssembly = nullptr;
 
 // Cached method pointers
@@ -66,16 +75,11 @@ static void* g_methodGenerateTextMesh = nullptr;
 static size_t g_fieldOffsetMaxVisibleCharacters = (size_t)-1;
 
 // UID control state
-static void* g_uidPanelGO = nullptr;
-static void* g_uidTextGO = nullptr;
-static void* g_uidPingGO = nullptr;
-static bool  g_uidHidden = true;
-static bool  g_pingHidden = false;
-static bool  g_menuUidHidden = true;
-static bool  g_menuNameHidden = true;
-static bool  g_cardUidHidden = true;
-static bool  g_cardNameHidden = true;
-static volatile bool  g_hookDisabled = false;  // Set during shutdown to prevent IL2CPP calls
+static std::atomic<bool> g_uidLocated{false};
+static uint32_t g_uidTextHandle=0,g_uidPingHandle=0;
+static std::atomic<uint32_t> g_uidCommand{1};
+static std::atomic<bool> g_uidHidden{true},g_pingHidden{false};
+static std::atomic<bool> g_menuUidHidden{true},g_menuNameHidden{true},g_cardUidHidden{true},g_cardNameHidden{true};
 
 // ============================================================================
 // IL2CPP String reading
@@ -105,7 +109,8 @@ static void* SafeInvoke(void* method, void* obj, void** params = nullptr) {
     if (!method) return nullptr;
     __try {
         void* exc = nullptr;
-        return p_il2cpp_runtime_invoke(method, obj, params, &exc);
+        void* result=p_il2cpp_runtime_invoke(method, obj, params, &exc);
+        return exc?nullptr:result;
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         return nullptr;
     }
@@ -131,8 +136,6 @@ static bool ResolveIL2Cpp() {
     if (!g_hGameAssembly) return false;
 
 #define R(name) p_##name = (t_##name)GetProcAddress(g_hGameAssembly, #name)
-    R(il2cpp_domain_get);
-    R(il2cpp_thread_attach);
     R(il2cpp_domain_get_assemblies);
     R(il2cpp_assembly_get_image);
     R(il2cpp_image_get_name);
@@ -145,33 +148,16 @@ static bool ResolveIL2Cpp() {
     R(il2cpp_class_get_type);
     R(il2cpp_string_new);
     R(il2cpp_gchandle_new);
-    R(il2cpp_gchandle_free);
+    R(il2cpp_gchandle_free);R(il2cpp_gchandle_get_target);
+    R(il2cpp_method_get_flags);R(il2cpp_method_get_param_count);R(il2cpp_method_get_return_type);R(il2cpp_type_get_type);
 #undef R
 
-    return p_il2cpp_domain_get && p_il2cpp_runtime_invoke &&
-           p_il2cpp_class_from_name && p_il2cpp_class_get_method_from_name;
+    return p_il2cpp_domain_get_assemblies && p_il2cpp_assembly_get_image && p_il2cpp_string_new && p_il2cpp_runtime_invoke &&
+           p_il2cpp_class_from_name && p_il2cpp_class_get_method_from_name &&
+           p_il2cpp_gchandle_new && p_il2cpp_gchandle_free && p_il2cpp_gchandle_get_target && g_uidBootstrap.Resolve(g_hGameAssembly);
 }
 
-static bool InitIL2CppScanner() {
-    for (int i = 0; i < 120; i++) {
-        // Wait for Unity window to ensure Unity engine & GC_allow_register_threads have completed
-        if (FindWindowW(L"UnityWndClass", nullptr) && ResolveIL2Cpp()) {
-            Log("[AM-IL2CPP] Resolved after %d attempts", i + 1);
-            break;
-        }
-        Sleep(500);
-    }
-    if (!g_hGameAssembly || !p_il2cpp_domain_get) {
-        Log("[AM-IL2CPP] Failed to resolve GameAssembly.dll");
-        return false;
-    }
-
-    void* dom = p_il2cpp_domain_get();
-    if (!dom) { Log("[AM-IL2CPP] domain_get failed"); return false; }
-    if (p_il2cpp_thread_attach) {
-        p_il2cpp_thread_attach(dom);
-    }
-
+static bool ScanUidMetadata(void* dom) {
     size_t asmCount = 0;
     void** asms = p_il2cpp_domain_get_assemblies(dom, &asmCount);
     if (!asms || asmCount == 0) {
@@ -260,6 +246,13 @@ static bool InitIL2CppScanner() {
             g_methodGenerateTextMesh);
     }
 
+    void* application=FindClassInAssemblies(asms,asmCount,"UnityEngine","Application");
+    if(application&&p_il2cpp_method_get_flags&&p_il2cpp_method_get_param_count&&p_il2cpp_method_get_return_type&&p_il2cpp_type_get_type) {
+        void* method=p_il2cpp_class_get_method_from_name(application,"Internal_ApplicationQuit",0);uint32_t impl=0;
+        if(method&&(p_il2cpp_method_get_flags(method,&impl)&0x10)&&!p_il2cpp_method_get_param_count(method)&&
+            p_il2cpp_type_get_type(p_il2cpp_method_get_return_type(method))==1)g_methodApplicationQuit=method;
+    }
+    if(!UidRuntimeOpen()||!g_methodSetText||!CaptureUidNative())return false;
     g_il2cppResolved = true;
     Log("[AM-IL2CPP] Scanner initialized successfully");
     return true;
@@ -269,93 +262,81 @@ static bool InitIL2CppScanner() {
 // UID Control — SetActive-based
 // ============================================================================
 
-static void* TryFindGO(const char* path) {
-    if (g_hookDisabled) return nullptr;
-    if (!g_methodGameObjectFind || !p_il2cpp_string_new) return nullptr;
-    void* dom = p_il2cpp_domain_get();
-    p_il2cpp_thread_attach(dom);
-    void* s = p_il2cpp_string_new(path);
-    void* p[1] = { s };
-    return SafeInvoke(g_methodGameObjectFind, nullptr, p);
+static bool InitIL2CppScanner() {
+    if(!InitializeUidOwner())return false;
+    bool guarded=false,resolved=false;
+    const auto deadline=GetTickCount64()+60000;
+    while(GetTickCount64()<deadline&&UidRuntimeOpen()) {
+        if(!resolved){resolved=ResolveIL2Cpp();if(!resolved){Sleep(50);continue;}}
+        if(!guarded) {
+            APH_NativeProc shutdown=(APH_NativeProc)GetProcAddress(g_hGameAssembly,"il2cpp_shutdown");
+            if(!shutdown||!UidShutdown::Install(shutdown,"void() C-export","il2cpp.runtime.shutdown")) {
+                hub::error_detail(g_uidOwner,"uid-startup",APH_E_UNAVAILABLE,"il2cpp_shutdown",0,0,0,0,"Cannot protect the VM shutdown boundary");
+                return false;
+            }
+            guarded=true;
+        }
+        bool ready=false,scanned=false;void* attached=nullptr;
+        AcquireSRWLockShared(&g_uidVmLock);g_uidVmHeld=true;
+        __try {
+            if(UidRuntimeOpen()&&g_uidBootstrap.Ready()) {
+                ready=true;void* domain=g_uidBootstrap.AttachWorker(&attached);
+                if(domain)scanned=ScanUidMetadata(domain);
+            }
+        } __finally {
+            // Stop's original waits on this lock; detach only the thread we attached.
+            g_uidBootstrap.DetachWorker(attached);g_uidVmHeld=false;ReleaseSRWLockShared(&g_uidVmLock);
+        }
+        if(scanned)return true;
+        if(ready&&!UidRuntimeOpen())return false;
+        Sleep(ready?250:50);
+    }
+    hub::error_detail(g_uidOwner,"uid-bootstrap",APH_E_UNAVAILABLE,"IL2CPP",0,0,0,0,"Timed out waiting for corlib, existing VM threads or TMP metadata");
+    return false;
 }
-
-static bool FindUidComponent() {
-    if (!g_il2cppResolved || !g_methodGameObjectFind || !p_il2cpp_string_new) {
-        Log("[AM-UID] IL2CPP not ready for UID lookup");
-        return false;
-    }
-
-    void* dom = p_il2cpp_domain_get();
-    p_il2cpp_thread_attach(dom);
-
-    // Find UIDPanelPanel
-    {
-        void* s = p_il2cpp_string_new("UINode/UIRoot/UIDPanelPanel");
-        void* p[1] = { s };
-        g_uidPanelGO = SafeInvoke(g_methodGameObjectFind, nullptr, p);
-    }
-    if (!g_uidPanelGO) {
-        Log("[AM-UID] UIDPanelPanel not found");
-        return false;
-    }
-    Log("[AM-UID] Found UIDPanelPanel: %p", g_uidPanelGO);
-
-    // Find UID Text GO
-    {
-        void* s = p_il2cpp_string_new("UINode/UIRoot/UIDPanelPanel/Main/TextNode/Text");
-        void* p[1] = { s };
-        g_uidTextGO = SafeInvoke(g_methodGameObjectFind, nullptr, p);
-    }
-    Log("[AM-UID] UID Text GO: %p", g_uidTextGO);
-
-    // Find Ping GO
-    {
-        void* s = p_il2cpp_string_new("UINode/UIRoot/UIDPanelPanel/Main/TextNode/PingCon");
-        void* p[1] = { s };
-        g_uidPingGO = SafeInvoke(g_methodGameObjectFind, nullptr, p);
-    }
-    Log("[AM-UID] Ping GO: %p", g_uidPingGO);
-
-    return (g_uidTextGO != nullptr || g_uidPingGO != nullptr);
+static void* UidFindGO(const char* path) {
+    if(!UidRuntimeOpen()||!g_methodGameObjectFind)return nullptr;
+    void* str=p_il2cpp_string_new(path);void* params[]={str};
+    return str?SafeInvoke(g_methodGameObjectFind,nullptr,params):nullptr;
 }
-
-static void GameObjectSetActive(void* go, bool active) {
-    if (!go || !g_methodGameObjectSetActive || g_hookDisabled) return;
-    __try {
-        void* dom = p_il2cpp_domain_get();
-        if (!dom) return;
-        p_il2cpp_thread_attach(dom);
-        int32_t val = active ? 1 : 0;
-        void* params[1] = { &val };
-        SafeInvoke(g_methodGameObjectSetActive, go, params);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        Log("[AM-UID] Exception in SetActive");
+static bool UidSetActive(uint32_t& handle,const char* path,bool visible) {
+    if(!UidRuntimeOpen()||!g_methodGameObjectSetActive)return false;
+    void* go=handle?p_il2cpp_gchandle_get_target(handle):nullptr;
+    if(!go) {
+        if(handle)p_il2cpp_gchandle_free(handle);handle=0;
+        go=UidFindGO(path);if(!go)return false;
+        handle=p_il2cpp_gchandle_new(go,1);if(!handle)return false;
     }
+    bool value=visible;void* params[]={&value};void* exception=nullptr;
+    p_il2cpp_runtime_invoke(g_methodGameObjectSetActive,go,params,&exception);
+    if(exception) {p_il2cpp_gchandle_free(handle);handle=0;return false;}
+    return UidRuntimeOpen();
 }
-
-static void SetUidVisible(bool visible) {
-    g_uidHidden = !visible;
-    if (!g_uidTextGO) {
-        g_uidTextGO = TryFindGO("UINode/UIRoot/UIDPanelPanel/Main/TextNode/Text");
-    }
-    if (!g_uidTextGO) return;
-    GameObjectSetActive(g_uidTextGO, visible);
+static void PumpUidCommands() {
+    static uint32_t applied=0;static uint64_t retry=0;
+    const uint32_t command=g_uidCommand.load(std::memory_order_acquire);
+    if(command==applied&&g_uidLocated.load(std::memory_order_relaxed))return;
+    const auto now=GetTickCount64();if(command==applied&&now<retry)return;
+    applied=command;retry=now+1000;
+    const bool uid=UidSetActive(g_uidTextHandle,"UINode/UIRoot/UIDPanelPanel/Main/TextNode/Text",!g_uidHidden.load());
+    const bool ping=UidSetActive(g_uidPingHandle,"UINode/UIRoot/UIDPanelPanel/Main/TextNode/PingCon",!g_pingHidden.load());
+    g_uidLocated.store(uid&&ping,std::memory_order_release);
 }
-
-static void SetPingVisible(bool visible) {
-    g_pingHidden = !visible;
-    if (!g_uidPingGO) {
-        g_uidPingGO = TryFindGO("UINode/UIRoot/UIDPanelPanel/Main/TextNode/PingCon");
-    }
-    if (!g_uidPingGO) return;
-    GameObjectSetActive(g_uidPingGO, visible);
+static void SetUidVisible(bool visible) {g_uidHidden=!visible;g_uidCommand.fetch_add(1,std::memory_order_release);}
+static void SetPingVisible(bool visible) {g_pingHidden=!visible;g_uidCommand.fetch_add(1,std::memory_order_release);}
+static bool UidBusinessBegin() {
+    if(g_uidVmHeld||!UidOnGameThread()||!UidRuntimeOpen())return false;
+    AcquireSRWLockShared(&g_uidVmLock);g_uidVmHeld=true;
+    if(!UidRuntimeOpen()){g_uidVmHeld=false;ReleaseSRWLockShared(&g_uidVmLock);return false;}
+    return true;
 }
+static void UidBusinessEnd(){g_uidVmHeld=false;ReleaseSRWLockShared(&g_uidVmLock);}
 
 // ============================================================================
 // set_text Hook — cached pointer architecture
 // ============================================================================
 
-#include "MinHook.h"
+#include "manager_hooks.h"
 
 struct MInfo { void* mp; };
 
@@ -373,6 +354,13 @@ static tNativeGetName      g_nativeGetName = nullptr;
 static tNativeGetTransform g_nativeGetTransform = nullptr;
 static tNativeGetParent    g_nativeGetParent = nullptr;
 static void*          g_cachedEmptyStr = nullptr;
+static uint32_t g_emptyTextHandle=0;
+static bool EnsureUidEmptyText() {
+    if(g_emptyTextHandle)return true;
+    void* value=p_il2cpp_string_new("");if(!value)return false;
+    g_emptyTextHandle=p_il2cpp_gchandle_new(value,1);
+    if(!g_emptyTextHandle)return false;g_cachedEmptyStr=value;return true;
+}
 static tTMPVoidMethod g_origGenerateTextMesh = nullptr;
 
 // Component pointer cache — avoids native calls for known components
@@ -465,7 +453,7 @@ static unsigned GetIdentityAncestorFlags(void* component) {
 }
 
 static bool ShouldSuppressIdentityMesh(void* component) {
-    if (!component || g_hookDisabled) return false;
+    if (!component || g_hookDisabled || !UidRuntimeOpen()) return false;
 
     int n = g_compCacheCount;
     for (int i = 0; i < n; i++) {
@@ -536,7 +524,7 @@ static bool ShouldSuppressIdentityMesh(void* component) {
 static bool TrySetTemporaryMaxVisibleCharacters(void* component,
                                                  int value,
                                                  int* previousValue) {
-    if (!component || !previousValue || g_hookDisabled) return false;
+    if (!component || !previousValue || g_hookDisabled || !UidRuntimeOpen()) return false;
     if (g_fieldOffsetMaxVisibleCharacters == (size_t)-1) return false;
 
     __try {
@@ -544,7 +532,8 @@ static bool TrySetTemporaryMaxVisibleCharacters(void* component,
         *previousValue = *field;
         *field = value;
         return true;
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
+    } __except(APH_EntryFilter(&g_uidHooks, g_uidOwner, g_generateClaim,
+                              GetExceptionInformation(), APH_ORIGINAL_NOT_ENTERED, APH_RECOVERY_NONE)) {
         return false;
     }
 }
@@ -557,61 +546,62 @@ static void RestoreMaxVisibleCharacters(void* component, int previousValue) {
     // It performs only a native field write and does not call back into IL2CPP.
     __try {
         int* field = (int*)((char*)component + g_fieldOffsetMaxVisibleCharacters);
-        *field = previousValue;
-    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        if (InterlockedCompareExchange((volatile LONG*)field, previousValue, 0) != 0) {
+            // A changed field is not ours to overwrite. Keep the owner and its
+            // native resources quarantined; no successful restoration is claimed.
+            g_hookDisabled = true;
+            g_uidHooks.record_fault(g_uidOwner, g_generateClaim, 0xe0410001u,
+                                    (uint64_t)(uintptr_t)field, APH_ORIGINAL_RETURNED, 0);
+        }
+    } __except(APH_EntryFilter(&g_uidHooks, g_uidOwner, g_generateClaim,
+                              GetExceptionInformation(), APH_ORIGINAL_RETURNED, APH_RECOVERY_NONE)) {}
 }
 
-static void hkGenerateTextMesh(void* __this, void* methodInfo) {
-    if (!g_origGenerateTextMesh) return;
-    if (g_hookDisabled) {
-        g_origGenerateTextMesh(__this, methodInfo);
-        return;
-    }
-
-    if (!ShouldSuppressIdentityMesh(__this)) {
-        g_origGenerateTextMesh(__this, methodInfo);
-        return;
-    }
-
-    int previousMaxVisibleCharacters = 0;
-    if (!TrySetTemporaryMaxVisibleCharacters(
-            __this, 0, &previousMaxVisibleCharacters)) {
-        g_origGenerateTextMesh(__this, methodInfo);
-        return;
-    }
-
-    // Let TMP complete its normal render pass with zero visible characters.
-    // Restoring in __finally avoids mutating persistent component state and
-    // guarantees cleanup if the original routine raises an SEH exception.
+static void hkGenerateTextMesh(void* self, void* methodInfo) {
+    APH_HookCall call{};
+    APH_Result entered = g_uidHooks.enter_call(g_uidOwner, g_generateClaim, &call);
+    volatile uint32_t phase = APH_ORIGINAL_NOT_ENTERED;
+    bool temporary = false;
+    int previous = 0;
     __try {
-        g_origGenerateTextMesh(__this, methodInfo);
+        __try {
+            if(entered==APH_OK&&(call.flags&APH_CALL_BUSINESS)&&UidBusinessBegin()) {
+                __try {PumpUidCommands();if(ShouldSuppressIdentityMesh(self))temporary=TrySetTemporaryMaxVisibleCharacters(self,0,&previous);}
+                __finally {UidBusinessEnd();}
+            }
+            phase = APH_ORIGINAL_RUNNING;
+            g_origGenerateTextMesh(self, methodInfo);
+            phase = APH_ORIGINAL_RETURNED;
+        } __except(APH_EntryFilter(&g_uidHooks, g_uidOwner, g_generateClaim,
+                                  GetExceptionInformation(), phase, APH_RECOVERY_NONE)) {}
     } __finally {
-        RestoreMaxVisibleCharacters(__this, previousMaxVisibleCharacters);
+        __try {
+            if (temporary) RestoreMaxVisibleCharacters(self, previous);
+        } __finally {
+            if (entered == APH_OK) g_uidHooks.leave_call(g_uidOwner, &call);
+        }
     }
 }
-
-static void hkTMPSetText(void* __this, void* value, void* methodInfo) {
+static void* SelectSetTextValue(void* __this, void* value) {
     // SHUTDOWN: passthrough immediately — g_cachedEmptyStr may be freed by IL2CPP GC
-    if (g_hookDisabled) {
-        g_origSetText(__this, value, methodInfo);
-        return;
+    if (g_hookDisabled || !UidRuntimeOpen()) {
+        return value;
     }
 
     // FAST PATH: cached pointer check (no native calls — deadlock-proof)
     int n = g_compCacheCount;
     for (int i = 0; i < n; i++) {
         if (g_compCache[i].comp == __this && IsHideActive(g_compCache[i].type)) {
-            g_origSetText(__this, g_cachedEmptyStr, methodInfo);
-            return;
+            return g_cachedEmptyStr;
         }
     }
 
     // SLOW PATH: identify new components by GO name (only when game is alive)
-    if (!g_hookDisabled && g_nativeGetGO && g_nativeGetName) {
+    if (!g_hookDisabled && UidRuntimeOpen() && g_nativeGetGO && g_nativeGetName) {
         bool anyHidden = g_uidHidden || g_menuUidHidden || g_menuNameHidden ||
                          g_cardUidHidden || g_cardNameHidden;
         if (anyHidden) {
-            __try {
+            {
                 void* go = g_nativeGetGO(__this, g_methodComponentGetGameObject);
                 if (go) {
                     void* nameStr = g_nativeGetName(go, g_methodTransformGetName);
@@ -621,22 +611,19 @@ static void hkTMPSetText(void* __this, void* value, void* methodInfo) {
                             if (strcmp(name, "ManagerNumber") == 0) {
                                 CacheComp(__this, HT_MENU_UID);
                                 if (g_menuUidHidden) {
-                                    g_origSetText(__this, g_cachedEmptyStr, methodInfo);
-                                    return;
+                                    return g_cachedEmptyStr;
                                 }
                             }
                             else if (strcmp(name, "ManagerName") == 0) {
                                 CacheComp(__this, HT_MENU_NAME);
                                 if (g_menuNameHidden) {
-                                    g_origSetText(__this, g_cachedEmptyStr, methodInfo);
-                                    return;
+                                    return g_cachedEmptyStr;
                                 }
                             }
                             else if (strcmp(name, "PlayerUidTxt") == 0) {
                                 CacheComp(__this, HT_CARD_UID);
                                 if (g_cardUidHidden) {
-                                    g_origSetText(__this, g_cachedEmptyStr, methodInfo);
-                                    return;
+                                    return g_cachedEmptyStr;
                                 }
                             }
                             else if (strcmp(name, "NameTxt") == 0) {
@@ -661,8 +648,7 @@ static void hkTMPSetText(void* __this, void* value, void* methodInfo) {
                                 if (isCard) {
                                     CacheComp(__this, HT_CARD_NAME);
                                     if (g_cardNameHidden) {
-                                        g_origSetText(__this, g_cachedEmptyStr, methodInfo);
-                                        return;
+                                        return g_cachedEmptyStr;
                                     }
                                 }
                             }
@@ -671,90 +657,87 @@ static void hkTMPSetText(void* __this, void* value, void* methodInfo) {
                                 if (ancestors & IAF_PERSONAL_INFO) {
                                     CacheComp(__this, HT_CARD_NAME);
                                     if (g_cardNameHidden) {
-                                        g_origSetText(__this, g_cachedEmptyStr, methodInfo);
-                                        return;
+                                        return g_cachedEmptyStr;
                                     }
                                 }
                                 else if (ancestors & IAF_WATCH_PANEL) {
                                     CacheComp(__this, HT_MENU_NAME);
                                     if (g_menuNameHidden) {
-                                        g_origSetText(__this, g_cachedEmptyStr, methodInfo);
-                                        return;
+                                        return g_cachedEmptyStr;
                                     }
                                 }
                             }
                         }
                     }
                 }
-            } __except(EXCEPTION_EXECUTE_HANDLER) {}
+            }
         }
     }
 
-    g_origSetText(__this, value, methodInfo);
+    return value;
 }
 
-static bool InstallSetTextHook() {
-    if (!g_methodSetText || !g_methodComponentGetGameObject || !g_methodTransformGetName)
-        return false;
-
-    g_nativeGetGO = (tNativeGetGO)((MInfo*)g_methodComponentGetGameObject)->mp;
-    g_nativeGetName = (tNativeGetName)((MInfo*)g_methodTransformGetName)->mp;
-    if (!g_nativeGetGO || !g_nativeGetName) return false;
-
-    if (g_methodComponentGetTransform)
-        g_nativeGetTransform = (tNativeGetTransform)((MInfo*)g_methodComponentGetTransform)->mp;
-    if (g_methodTransformGetParent)
-        g_nativeGetParent = (tNativeGetParent)((MInfo*)g_methodTransformGetParent)->mp;
-
-    g_cachedEmptyStr = p_il2cpp_string_new("");
-    if (g_cachedEmptyStr && p_il2cpp_gchandle_new) {
-        p_il2cpp_gchandle_new(g_cachedEmptyStr, 1); // 1 = pinned GC handle
-    }
-
-    void* mp = ((MInfo*)g_methodSetText)->mp;
-    if (!mp) return false;
-
-    MH_STATUS initStatus = MH_Initialize();
-    if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED) {
-        Log("[AM-UID] MH_Initialize failed: %d", initStatus);
-        return false;
-    }
-    if (MH_CreateHook(mp, (void*)hkTMPSetText, (void**)&g_origSetText) != MH_OK) {
-        Log("[AM-UID] MH_CreateHook for set_text failed");
-        return false;
-    }
-    MH_EnableHook(mp);
-    g_setTextHooked = true;
-    Log("[AM-UID] Hooked TMP_Text.set_text: %p (getGO=%p, getName=%p)",
-        mp, g_nativeGetGO, g_nativeGetName);
-
-    if (g_methodGenerateTextMesh &&
-        g_fieldOffsetMaxVisibleCharacters != (size_t)-1) {
-        void* generateMp = ((MInfo*)g_methodGenerateTextMesh)->mp;
-        if (generateMp && generateMp != mp) {
-            MH_STATUS generateCreateStatus = MH_CreateHook(
-                generateMp, (void*)hkGenerateTextMesh,
-                (void**)&g_origGenerateTextMesh);
-            if (generateCreateStatus != MH_OK) {
-                Log("[AM-UID] GenerateTextMesh hook creation failed: %d",
-                    generateCreateStatus);
+static void hkTMPSetText(void* self, void* value, void* methodInfo) {
+    APH_HookCall call{};
+    APH_Result entered = g_uidHooks.enter_call(g_uidOwner, g_setTextClaim, &call);
+    volatile uint32_t phase = APH_ORIGINAL_NOT_ENTERED;
+    __try {
+        __try {
+            if(entered==APH_OK&&(call.flags&APH_CALL_BUSINESS)&&UidBusinessBegin()) {
+                __try {PumpUidCommands();if(EnsureUidEmptyText())value=SelectSetTextValue(self,value);}
+                __finally {UidBusinessEnd();}
             }
-            else {
-                MH_STATUS generateEnableStatus = MH_EnableHook(generateMp);
-                if (generateEnableStatus != MH_OK) {
-                    Log("[AM-UID] GenerateTextMesh hook enable failed: %d",
-                        generateEnableStatus);
-                }
-                else {
-                    Log("[AM-UID] Hooked TextMeshProUGUI.GenerateTextMesh: %p (dynamic visibility field)",
-                        generateMp);
-                }
+            phase = APH_ORIGINAL_RUNNING;
+            g_origSetText(self, value, methodInfo);
+            phase = APH_ORIGINAL_RETURNED;
+        } __except(APH_EntryFilter(&g_uidHooks, g_uidOwner, g_setTextClaim,
+                                  GetExceptionInformation(), phase, APH_RECOVERY_NONE)) {}
+    } __finally {
+        if (entered == APH_OK) g_uidHooks.leave_call(g_uidOwner, &call);
+    }
+}
+// Called only while the scanner holds the VM boundary, before worker detach.
+static bool CaptureUidNative() {
+    if(!g_methodSetText||!g_methodComponentGetGameObject||!g_methodTransformGetName)return false;
+    g_nativeGetGO=(tNativeGetGO)((MInfo*)g_methodComponentGetGameObject)->mp;
+    g_nativeGetName=(tNativeGetName)((MInfo*)g_methodTransformGetName)->mp;
+    if(g_methodComponentGetTransform)g_nativeGetTransform=(tNativeGetTransform)((MInfo*)g_methodComponentGetTransform)->mp;
+    if(g_methodTransformGetParent)g_nativeGetParent=(tNativeGetParent)((MInfo*)g_methodTransformGetParent)->mp;
+    g_uidSetTextAddress=((MInfo*)g_methodSetText)->mp;
+    if(g_methodGenerateTextMesh)g_uidGenerateAddress=((MInfo*)g_methodGenerateTextMesh)->mp;
+    if(g_methodApplicationQuit)g_uidQuitAddress=((MInfo*)g_methodApplicationQuit)->mp;
+    return g_nativeGetGO&&g_nativeGetName&&g_uidSetTextAddress;
+}
+static bool InstallSetTextHook() {
+    if(!UidRuntimeOpen()||!g_uidSetTextAddress)return false;
+    if(g_uidQuitAddress&&!UidApplicationQuit::Install((APH_NativeProc)g_uidQuitAddress,
+        "void(MethodInfo*) static","unity.Application.Internal_ApplicationQuit"))return false;
+    void* mp=g_uidSetTextAddress;
+    APH_NativeProc original = nullptr;
+    if (!PrepareUidHook(mp, (APH_NativeProc)hkTMPSetText, 1,
+                        "win64:void(void*,Il2CppString*,MethodInfo*)", &g_setTextClaim, &original)) {
+        hub::fail_owner(g_uidOwner, APH_E_BACKEND); return false;
+    }
+    g_origSetText = (tTMPSetText)original;
+    if (g_uidHooks.activate_hook(g_uidOwner, g_setTextClaim, original) < 0 || !WaitUidHook(g_setTextClaim, APH_HOOK_ACTIVE)) {
+        hub::fail_owner(g_uidOwner, APH_E_BACKEND); return false;
+    }
+    g_setTextHooked = true;
+    if (g_uidGenerateAddress && g_fieldOffsetMaxVisibleCharacters != (size_t)-1) {
+        void* target = g_uidGenerateAddress;
+        if (target && target != mp) {
+            if (!PrepareUidHook(target, (APH_NativeProc)hkGenerateTextMesh, 2,
+                                "win64:void(void*,MethodInfo*)", &g_generateClaim, &original)) {
+                hub::fail_owner(g_uidOwner, APH_E_BACKEND); return false;
+            }
+            g_origGenerateTextMesh = (tTMPVoidMethod)original;
+            if (g_uidHooks.activate_hook(g_uidOwner, g_generateClaim, original) < 0 || !WaitUidHook(g_generateClaim, APH_HOOK_ACTIVE)) {
+                hub::fail_owner(g_uidOwner, APH_E_BACKEND); return false;
             }
         }
     }
-    else if (g_methodGenerateTextMesh) {
-        Log("[AM-UID] GenerateTextMesh hook skipped: visibility field unavailable");
-    }
+    hub::finish_enable(g_uidOwner, APH_OK);
+    Log("[AM-UID] UID hooks prepared and activated through Core");
     return true;
 }
 

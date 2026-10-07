@@ -49,12 +49,18 @@ static std::string TrimWhitespace(const std::string& s) {
     return s.substr(start, end - start + 1);
 }
 
+static FILE* OpenConfigUtf8(const char* path, const wchar_t* mode) {
+    wchar_t widePath[MAX_PATH];
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, widePath, MAX_PATH)) return nullptr;
+    return _wfopen(widePath, mode);
+}
+
 static ConfigFile LoadConfigFile(const char* path) {
     ConfigFile cfg;
     cfg.filePath = path;
     cfg.loaded = false;
 
-    FILE* f = fopen(path, "r");
+    FILE* f = OpenConfigUtf8(path, L"r");
     if (!f) return cfg;
 
     char buf[1024];
@@ -179,7 +185,7 @@ static bool ConfigSetValue(ConfigFile& cfg, const char* key, const char* value,
 // ============================================================================
 
 static bool SaveConfigFile(const ConfigFile& cfg) {
-    FILE* f = fopen(cfg.filePath.c_str(), "w");
+    FILE* f = OpenConfigUtf8(cfg.filePath.c_str(), L"w");
     if (!f) return false;
 
     for (const auto& line : cfg.lines) {

@@ -2,14 +2,19 @@
 
 [English](README_EN.md) | 中文
 
-为《明日方舟：终末地》设计的dll插件管理器。提供统一的插件加载、热键管理和配置界面，支持多语言切换。通过独立的 DX11 叠加层窗口显示GUI，内置 UID隐藏功能进行安装验证，可一键隐藏游戏中、菜单、名片中的 UID 与玩家名。
+为《明日方舟：终末地》设计的 DLL 插件管理器。Manager 内置 Core，提供新版插件加载、独占与 typed 共享 Hook、受管指针槽及窗口路由，以及异步逻辑启停和动画/相机独立写权；保留独立 DX11 面板和 UID 隐藏功能。插件接入协议见 [SDK](sdk/README.md)。
 
 ## 主要功能
 
-- **插件管理**：自动扫描 `plugin\` 目录下的 DLL 插件，支持启用/禁用、暂停/恢复，状态实时显示
-- **热键管理**：集中显示所有插件的热键配置，支持冲突检测与一键重绑定
+- **插件管理**：CoreReady 后扫描 `plugin\`，核对新版清单、ABI、重复 ID、必要能力；分别显示加载、接入和活动状态
+- **通用 Hook**：动态独占与 typed 共享目标、两阶段激活、同址去重、准确原型与 SEH 薄层；SDK 位于 `sdk/`
+- **共享服务**：PointerPatch 条件恢复、统一游戏窗口链、最小 Runtime/目标代次票据
+- **启停/写权**：运行时按钮异步加载、启用和停用已适配插件；确认恢复后才显示 Disabled；Enable 不授予动画/相机写权，DLL 保持常驻
+- **启动配置**：面板勾选项控制下次启动，与本次运行的启停按钮分开
 - **UID隐藏**：隐藏游戏内 UID、延迟显示、菜单 UID/名字、名片 UID/名字
-- **多语言界面**：中文/英文一键切换，语言同步推送至所有支持的插件
+- **多语言界面**：Manager 面板中文/英文切换
+
+支持可选插件依赖与版本化服务、失败详情及有界日志轮换。SDK 1.1 兼容现有 1.0 插件；内置 UID 的游戏对象操作在已验证的游戏线程执行。接口与示例见 [SDK 说明](sdk/README.md)。
 
 ## 用户协议与免责声明
 
@@ -42,7 +47,7 @@ bin/vulkan-1.dll           → 游戏目录/vulkan-1.dll
 bin/d3dcompiler_47.dll     → 游戏目录/d3dcompiler_47.dll
 ```
 
-> **注意**：`d3dcompiler_47.dll`（DX环境）和 `vulkan-1.dll`（Vulkan环境）为代理加载器，二者放其一或全放均可。如果你同时在使用其他共用的代理加载器插件，无需重复放置代理加载器。
+> `d3dcompiler_47.dll`（DX）和 `vulkan-1.dll`（Vulkan）只引导 Manager，二者放其一或全放均可。插件通过 SDK 接入，不提供旧代理、旧业务包或旧宿主桥接。
 
 > 如果您**没有安装过此类型的插件**，您可能需要自行创建plugin文件夹。
 
@@ -50,9 +55,13 @@ bin/d3dcompiler_47.dll     → 游戏目录/d3dcompiler_47.dll
 
 1. 按上述方式安装后启动游戏。
 2. 按 `HOME` 键打开/关闭管理器面板。
-3. 面板中可以查看和管理所有已加载的插件，调整UID隐藏选项，重绑定热键。
+3. 查看插件加载/Attach/能力状态，设置下次启动是否加载，并调整 UID 隐藏选项。
 4. 点击面板语言切换按钮切换语言。
 
 ## 插件开发
 
-如果您想开发与 Applepie Manager 对接的插件，请参阅 [插件开发文档 (applepie.md)](applepie.md)。
+插件可使用 [C++ 客户端封装](sdk/applepie_client.h)，需要常用终末地共享 Hook 时再包含[可选适配器](sdk/applepie_endfield_adapters.h)；底层 [C API](sdk/applepie.h) 继续开放。接入协议与可编译示例见 [SDK 说明](sdk/README.md)。运行 `sdk\examples\build.bat` 编译最小插件，加 `/verify` 可运行独立的离线验证，不会启动或部署到游戏。
+
+迁移旧插件时，可让编码代理使用 [Applepie 插件迁移 skill](skills/applepie-plugin-migration/SKILL.md)，按实际操作选择接入方式，保留特殊 Hook、slot 和业务恢复逻辑。
+
+安装 Visual Studio 的 C++ 桌面开发工具后，在项目根目录运行 `build.bat`。正式构建生成 `bin/applepie_manager.dll`、`bin/d3dcompiler_47.dll` 和 `bin/vulkan-1.dll`。
