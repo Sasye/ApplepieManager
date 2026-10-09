@@ -11,8 +11,8 @@
 #endif
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,2,0,0
- PRODUCTVERSION 0,2,0,0
+ FILEVERSION 0,2,1,0
+ PRODUCTVERSION 0,2,1,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -25,12 +25,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "ApplepieManager"
             VALUE "FileDescription", "Applepie Manager"
-            VALUE "FileVersion", "0.2.0"
+            VALUE "FileVersion", "0.2.1"
             VALUE "InternalName", "applepie_manager"
             VALUE "LegalCopyright",   "AGPL-3.0"
             VALUE "OriginalFilename", "applepie_manager.dll"
             VALUE "ProductName", "Applepie Manager"
-            VALUE "ProductVersion", "0.2.0"
+            VALUE "ProductVersion", "0.2.1"
         END
     END
     BLOCK "VarFileInfo"
@@ -38,3 +38,7 @@ BEGIN
         VALUE "Translation", 0x409, 1200
     END
 END
+
+// Native settings UI and tab icon are embedded; no external assets are required.
+102 RCDATA "src\\native_settings.lua"
+103 RCDATA "assets\\icons\\applepie-manager-ingame-256.png"

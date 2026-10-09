@@ -6,6 +6,7 @@
 #include "applepie_seh.h"
 #include "applepie_pointer_scope.h"
 #include <cstring>
+#include <vector>
 
 namespace applepie {
 namespace detail {
@@ -35,6 +36,8 @@ APH_CLIENT_SERVICE(APH_PluginServiceApi, APH_SERVICE_PLUGINS, sizeof(APH_PluginS
     a.publish && a.withdraw && a.find && a.invoke);
 APH_CLIENT_SERVICE(APH_DiagnosticsApi, APH_SERVICE_DIAGNOSTICS, sizeof(APH_DiagnosticsApi),
     a.last_error && a.report);
+APH_CLIENT_SERVICE(APH_ConfigApi, APH_SERVICE_CONFIG, APH_CONFIG_API_V1_PREFIX_BYTES,
+    a.register_schema && a.field && a.option && a.snapshot && a.save);
 #undef APH_CLIENT_SERVICE
 template<> struct ServiceTraits<APH_HookApi> {
     static constexpr uint64_t id = APH_SERVICE_HOOKS;
@@ -123,6 +126,47 @@ public:
     APH_Result Disable() const { return life_.size ? life_.disable(owner_) : APH_E_UNAVAILABLE; }
     APH_Result Checkpoint() const { return life_.size ? life_.checkpoint(owner_) : APH_E_UNAVAILABLE; }
     const APH_LifecycleApi* lifecycle() const { return life_.size ? &life_ : nullptr; }
+};
+
+// Optional settings. Core owns persistence and optional completion dispatch;
+// the plugin owns the notification context and chooses how to apply the values.
+class Config {
+    APH_Owner owner_ = 0;
+    APH_ConfigApi api_{};
+public:
+    APH_Result Register(const Client& client, const APH_ConfigField* fields, uint32_t count) {
+        if (owner_) return APH_E_DUPLICATE;
+        APH_ConfigApi api{};
+        auto r = client.Service(api);
+        if (r != APH_OK) return r;
+        const APH_ConfigSchema schema{sizeof(schema), count, fields};
+        r = api.register_schema(client.owner(), &schema);
+        if (r == APH_OK) { owner_ = client.owner(); api_ = api; }
+        return r;
+    }
+    APH_Result Status(APH_ConfigSnapshot& out) const {
+        return owner_ ? api_.snapshot(owner_, sizeof(out), &out, 0, nullptr) : APH_E_UNAVAILABLE;
+    }
+    APH_Result Notify(APH_ConfigNotifyFn callback, void* context = nullptr) const {
+        return owner_ && api_.set_notifier ? api_.set_notifier(owner_, callback, context) : APH_E_UNAVAILABLE;
+    }
+    APH_Result Read(APH_ConfigSnapshot& out, std::vector<APH_ConfigValue>& values) const {
+        APH_ConfigSnapshot status{};
+        auto r = Status(status);
+        if (r != APH_OK) return r;
+        values.resize(status.field_count);
+        return api_.snapshot(owner_, sizeof(out), &out, status.field_count, values.data());
+    }
+    APH_Result Field(uint32_t index, APH_ConfigField& out) const {
+        return owner_ ? api_.field(owner_, index, sizeof(out), &out) : APH_E_UNAVAILABLE;
+    }
+    APH_Result Option(uint32_t field, uint32_t index, APH_ConfigOption& out) const {
+        return owner_ ? api_.option(owner_, field, index, sizeof(out), &out) : APH_E_UNAVAILABLE;
+    }
+    APH_Result Save(uint64_t revision, const std::vector<APH_ConfigValue>& edited) const {
+        if (edited.size() > UINT32_MAX) return APH_E_ARGUMENT;
+        return owner_ ? api_.save(owner_, revision, uint32_t(edited.size()), edited.data()) : APH_E_UNAVAILABLE;
+    }
 };
 
 // Module identity is evidence of where an address resides, NOT of its true ABI

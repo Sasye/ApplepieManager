@@ -3,6 +3,7 @@
 #define NOMINMAX
 #include "manager_loader.h"
 #include "hub_internal.h"
+#include "manager_events.h"
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -16,6 +17,7 @@ unsigned plugin_count;
 bool desired[128]{}, requested[128]{};
 HANDLE loader_wake;
 wchar_t plugin_directory[MAX_PATH]{};
+manager_config::Settings initial_preferences;
 
 bool range(uint32_t rva, size_t bytes, uint32_t image_size) {
     return rva < image_size && bytes <= image_size - rva;
@@ -102,6 +104,7 @@ void save_plugin(unsigned index, const loader::Plugin& p) {
     __try { changed=memcmp(&plugins[index],&p,sizeof(p))!=0;plugins[index] = p; }
     __finally { ReleaseSRWLockExclusive(&plugin_lock); }
     if(!changed)return;
+    manager_events::notify();
     char filename[MAX_PATH * 3]{};
     WideCharToMultiByte(CP_UTF8, 0, p.filename, -1, filename, sizeof(filename), nullptr, nullptr);
     char message[1024];
@@ -110,34 +113,6 @@ void save_plugin(unsigned index, const loader::Plugin& p) {
         filename, p.manifest.id, (unsigned long long)p.owner, loader::state_name(p.state),
         (unsigned)p.loaded, (unsigned)p.attached, (unsigned)p.capabilities_ready, p.result,p.stage,p.win32_error,p.detail);
     hub::log_line(message);
-}
-bool plugin_enabled(const wchar_t* config, const wchar_t* filename) {
-    char name[MAX_PATH * 3];
-    if (!WideCharToMultiByte(CP_UTF8, 0, filename, -1, name, sizeof(name), nullptr, nullptr)) return false;
-    FILE* file = nullptr;
-    if (_wfopen_s(&file, config, L"rb") || !file) return true;
-    bool in_plugins = false;
-    char line[1024];
-    __try {
-        while (fgets(line, sizeof(line), file)) {
-            char* p = line;
-            if (strlen(p) >= 3 && (unsigned char)p[0] == 0xef && (unsigned char)p[1] == 0xbb && (unsigned char)p[2] == 0xbf) p += 3;
-            while (*p == ' ' || *p == '\t') ++p;
-            size_t n = strlen(p);
-            while (n && (p[n-1] == ' ' || p[n-1] == '\t' || p[n-1] == '\r' || p[n-1] == '\n')) p[--n] = 0;
-            if (*p == '[') { in_plugins = !_stricmp(p, "[plugins]"); continue; }
-            if (!in_plugins || *p == '#' || *p == ';') continue;
-            char* eq = strchr(p, '=');
-            if (!eq) continue;
-            char* key_end = eq;
-            while (key_end > p && (key_end[-1] == ' ' || key_end[-1] == '\t')) --key_end;
-            *key_end = 0;
-            char* value = eq + 1;
-            while (*value == ' ' || *value == '\t') ++value;
-            if (!_stricmp(p, name)) return !strcmp(value, "1") || !_stricmp(value, "true");
-        }
-    } __finally { fclose(file); }
-    return true;
 }
 bool valid_info(const loader::Plugin& p) {
     if(!p.has_info)return true;
@@ -278,9 +253,8 @@ void load_plugin(unsigned i,bool late) {
 }
 void load_plugins() {
     InterlockedIncrement(&scan_count);
-    wchar_t pattern[MAX_PATH], config[MAX_PATH];
+    wchar_t pattern[MAX_PATH];
     swprintf_s(pattern, L"%s\\*.dll", plugin_directory);
-    swprintf_s(config, L"%s\\applepie_manager_config.txt", plugin_directory);
     WIN32_FIND_DATAW entry{};
     HANDLE find = FindFirstFileW(pattern, &entry);
     if (find == INVALID_HANDLE_VALUE) return;
@@ -305,7 +279,7 @@ void load_plugins() {
     // become Active before dependent DllMain/Attach/Enable can run.
     for(unsigned i=0;i<plugin_count;++i) {
         auto p=plugins[i];wchar_t path[MAX_PATH];swprintf_s(path,L"%s\\%s",plugin_directory,p.filename);
-        p.enabled=plugin_enabled(config,p.filename);desired[i]=p.enabled;
+        p.enabled=manager_config::plugin_enabled(initial_preferences,p.filename);desired[i]=p.enabled;
         p.result=preflight(path,&p);p.inspected=true;
         if(p.result==APH_E_UNAVAILABLE)p.state=loader::Dependency;
         else if(p.result!=APH_OK||!valid_manifest(p.manifest)||!valid_info(p)) {
@@ -363,6 +337,7 @@ DWORD WINAPI management_thread(void*) {
                 AcquireSRWLockExclusive(&plugin_lock);
                 if(desired[i]==want)requested[i]=false;
                 ReleaseSRWLockExclusive(&plugin_lock);
+                manager_events::notify();
             }
         }
     }
@@ -386,6 +361,14 @@ DWORD WINAPI bootstrap_thread(void*) {
     }
     InterlockedExchange(&boot_state, APH_CORE_READY);
     hub::diagnostic("CoreReady", 0, 0, APH_OK);
+    try { initial_preferences = manager_config::load(plugin_directory); }
+    catch (...) { initial_preferences.load_error = ERROR_NOT_ENOUGH_MEMORY; }
+    if (initial_preferences.load_error || initial_preferences.save_error) {
+        char message[160];
+        sprintf_s(message, "[APH] Manager config: load=%lu save=%lu\n",
+            initial_preferences.load_error, initial_preferences.save_error);
+        hub::log_line(message);
+    }
     load_plugins();
     InterlockedExchange(&boot_state, APH_SCANNED);
     loader_wake=CreateEventW(nullptr,FALSE,FALSE,nullptr);
@@ -459,6 +442,7 @@ APH_Result request_enabled(unsigned index,bool enabled) {
     SetEvent(loader_wake);return APH_PENDING;
 }
 const wchar_t* directory() { return plugin_directory; }
+const manager_config::Settings& initial_config() { return initial_preferences; }
 const char* state_name(uint32_t state) {
     static const char* names[] = {"Disabled", "Dependency", "Rejected", "Duplicate", "LoadFailed", "Loaded",
         "AttachFailed", "Attached", "WaitingCapabilities", "Enabling", "Active", "Failed", "NeedsRestart", "Disabling", "Queued", "WaitingDependencies"};

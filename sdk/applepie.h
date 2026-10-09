@@ -27,7 +27,8 @@ enum {
     APH_E_SIGNATURE = -10, APH_E_MODE = -11, APH_E_CONFLICT = -12,
     APH_E_KEY_REUSED = -13, APH_E_BUILD = -14, APH_E_FOREIGN_PATCH = -15,
     APH_E_CAPABILITY = -16, APH_E_DUPLICATE = -17,
-    APH_E_DEPENDENCY = -18, APH_E_VERSION = -19, APH_E_CYCLE = -20
+    APH_E_DEPENDENCY = -18, APH_E_VERSION = -19, APH_E_CYCLE = -20,
+    APH_E_IO = -21
 };
 #define APH_CAP_CORE UINT64_C(1)
 #define APH_CAP_HOOKS UINT64_C(2)
@@ -456,6 +457,69 @@ typedef struct APH_DiagnosticsApi {
     APH_Result (APH_CALL *last_error)(APH_Owner, uint32_t bytes, APH_ErrorDetail*);
     APH_Result (APH_CALL *report)(APH_Owner, const APH_ErrorDetail*);
 } APH_DiagnosticsApi;
+
+/* Optional module-lifetime basic settings. All strings are bounded UTF-8.
+ * Registration copies the schema and reads disk once; call from Attach/worker.
+ * Snapshots are memory-only. Optional completion notices never grant game access.
+ * Saving is asynchronous and publishes values only after atomic replacement.
+ * Config ID "manager" is reserved for Manager's own preferences file.
+ * Old hosts return UNAVAILABLE from copy_service; existing ABI is unchanged. */
+#define APH_SERVICE_CONFIG UINT64_C(0x415048434f4e4631)
+enum { APH_CONFIG_BOOL = 1, APH_CONFIG_INT, APH_CONFIG_FLOAT, APH_CONFIG_ENUM, APH_CONFIG_TEXT, APH_CONFIG_KEY };
+enum { APH_CONFIG_TEXT_BYTES = 256 };
+typedef struct APH_ConfigValue {
+    uint32_t type;
+    int32_t integer; /* BOOL: 0/1; INT: signed 32 bits; KEY: Windows VK 0..255, 0 unbound */
+    double number; /* FLOAT only, finite */
+    char text[APH_CONFIG_TEXT_BYTES]; /* ENUM: stable option string; TEXT: one line */
+} APH_ConfigValue;
+typedef struct APH_ConfigOption { char value[64]; } APH_ConfigOption;
+typedef struct APH_ConfigField {
+    uint32_t size, type;
+    char key[48], label[96], description[160];
+    APH_ConfigValue initial;
+    double minimum, maximum; /* Required range for INT/FLOAT; inclusive. */
+    uint32_t text_max_bytes, option_count; /* TEXT: 1..255 UTF-8 bytes; ENUM: nonempty */
+    const APH_ConfigOption* options; /* Copied at registration; field() returns NULL here. */
+} APH_ConfigField;
+typedef struct APH_ConfigSchema {
+    uint32_t size, field_count;
+    const APH_ConfigField* fields; /* Copied, including defaults and options. */
+} APH_ConfigSchema;
+typedef struct APH_ConfigSnapshot {
+    uint32_t size, field_count;
+    uint64_t revision; /* Starts at 1. Incremented only after a successful save. */
+    uint32_t pending;
+    APH_Result last_result;
+    uint32_t win32_error, defaulted_fields; /* Number of invalid stored fields. */
+} APH_ConfigSnapshot;
+typedef void (APH_CALL *APH_ConfigNotifyFn)(APH_Owner, void*);
+enum { APH_CONFIG_API_V1_PREFIX_BYTES = 48 };
+typedef struct APH_ConfigApi {
+    uint32_t size, version;
+    APH_Result (APH_CALL *register_schema)(APH_Owner, const APH_ConfigSchema*);
+    APH_Result (APH_CALL *field)(APH_Owner, uint32_t index, uint32_t bytes, APH_ConfigField*);
+    APH_Result (APH_CALL *option)(APH_Owner, uint32_t field, uint32_t index, uint32_t bytes, APH_ConfigOption*);
+    /* NULL values + zero capacity reads metadata only. Otherwise capacity must
+     * hold field_count values in schema order. No partial success. */
+    APH_Result (APH_CALL *snapshot)(APH_Owner, uint32_t bytes, APH_ConfigSnapshot*,
+                                  uint32_t capacity, APH_ConfigValue* values);
+    /* Full transaction. Expected revision prevents overwriting newer edits.
+     * PENDING: queued; BUSY: another save; STALE: reread before retrying.
+     * Use completion notices, then read a snapshot. Config survives disable/enable;
+     * plugins apply snapshots in their own appropriate phase, not on this call. */
+    APH_Result (APH_CALL *save)(APH_Owner, uint64_t expected_revision,
+                              uint32_t count, const APH_ConfigValue*);
+    /* Optional appended v1 extension. Install once after register_schema, before
+     * the first save; then read the initial snapshot once. Older hosts leave NULL.
+     * Requires MODULE_OBSERVER. Callback/context live for the entire module,
+     * including logical disable. No unregister/replacement or hot unloading.
+     * Notices run serially per owner, outside registry/configuration locks, after save success
+     * OR failure. Read the current snapshot (later saves may already be pending).
+     * Only update plugin-owned data or signal work; no game calls or waits, and
+     * no exceptions crossing the ABI. Faulted owners receive no further notices. */
+    APH_Result (APH_CALL *set_notifier)(APH_Owner, APH_ConfigNotifyFn, void* user_data);
+} APH_ConfigApi;
 static inline const char* APH_ResultName(APH_Result r) {
     switch(r) {
     case APH_OK:return "OK";case APH_PENDING:return "Pending";
@@ -469,6 +533,7 @@ static inline const char* APH_ResultName(APH_Result r) {
     case APH_E_FOREIGN_PATCH:return "Foreign hook conflict";case APH_E_CAPABILITY:return "Capability missing";
     case APH_E_DUPLICATE:return "Duplicate ID";case APH_E_DEPENDENCY:return "Dependency unavailable";
     case APH_E_VERSION:return "Version mismatch";case APH_E_CYCLE:return "Dependency cycle";
+    case APH_E_IO:return "Configuration I/O failure";
     case APH_E_CONTRACT:return "Contract mismatch";case APH_E_STALE:return "Stale epoch or handle";
     case APH_E_THREAD:return "Wrong thread";case APH_E_EXPECTED:return "Expected value mismatch";
     default:return "Unknown result";

@@ -28,6 +28,7 @@ void leave_owner(APH_Owner);
 uint64_t owner_epoch(APH_Owner);
 bool owner_usable(APH_Owner);
 bool owner_resident(APH_Owner);
+bool owner_identity(APH_Owner, APH_Manifest*, HMODULE*); // internal copied identity
 bool owner_runtime_open(APH_Owner); // lock-free, terminal failure closes permanently
 uint32_t owner_flags(APH_Owner);
 bool admit_module(APH_Owner);

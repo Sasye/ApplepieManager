@@ -1,12 +1,12 @@
 # Applepie SDK
 
-本文对应 **Applepie Manager v0.2.0**。管理器发布版本与 SDK ABI 独立编号；当前基础 ABI 为 **1.1**（兼容 1.0 插件），各服务版本为 1。
+本文对应 **Applepie Manager v0.2.1**。管理器发布版本与 SDK ABI 独立编号；当前基础 ABI 为 **1.1**（兼容 1.0 插件），各服务版本为 1。
 
 SDK 由 `applepie_manager.dll` 提供，全部 C 接口统一在 [applepie.h](applepie.h)。平台为 Windows x64、MSVC C11/C++17、8 字节 pack。公开边界只传固定 POD、opaque handle、函数指针和模块期 context，不传 STL/CRT 对象、C++ 异常或分配所有权。
 
 新插件可以直接使用 [C++ 客户端封装](applepie_client.h)；需要终末地常用共享 Hook 时，再包含 [可选适配器](applepie_endfield_adapters.h)。底层辅助头包括 [准确签名入口](applepie_native.h)、[SEH](applepie_seh.h)、[指针槽作用域](applepie_pointer_scope.h)和[终末地共享数据契约](applepie_endfield_contracts.h)。C API 继续开放，可以按需混合使用。
 
-迁移现有插件可使用 [Applepie 插件迁移 skill](../skills/applepie-plugin-migration/SKILL.md)。将完整的 `skills/applepie-plugin-migration` 文件夹放入 `$CODEX_HOME/skills`（未设置时为 `~/.codex/skills`），调用 `$applepie-plugin-migration` 并提供插件源码与 SDK 目录；其他工具也可以直接读取 `SKILL.md` 执行迁移。技能本身不包含 SDK 或游戏地址。
+开发新插件或扩展功能可使用 [Applepie 插件开发 skill](../skills/applepie-plugin-development/SKILL.md)；迁移现有插件可使用 [Applepie 插件迁移 skill](../skills/applepie-plugin-migration/SKILL.md)。将对应的完整技能文件夹放入 `$CODEX_HOME/skills`（未设置时为 `~/.codex/skills`），调用 `$applepie-plugin-development` 或 `$applepie-plugin-migration` 并提供插件源码/目标目录与 SDK 目录；其他工具也可以直接读取 `SKILL.md` 执行。技能本身不包含 SDK 或游戏地址。
 
 ## 从可编译示例开始
 
@@ -19,7 +19,7 @@ sdk\examples\build.bat
 sdk\examples\build.bat /verify
 ```
 
-第一条编译基础示例 `sdk/examples/bin/applepie_example.dll`，以及跨插件服务示例 `applepie_service1.dll`（提供方）和 `applepie_service0.dll`（使用方）；没有配置编译环境时脚本尝试通过 vswhere 寻找 MSVC。第二条还会编译并运行[离线验证宿主](examples/verify.cpp)，链接本仓库真实 Core 与 MinHook 后端，在独立进程中加载示例 DLL。它不启动游戏、不部署文件，也不向其他进程注入。单独分发 SDK 时，普通示例构建只需 SDK 头文件及示例源码；`/verify` 另外需要本仓库的 `src/`、MinHook 依赖，以及示例目录中的 `abi_verify.c`、`hook_thunks.asm`（由 MSVC 的 `ml64` 编译）。这些验证源码不参与正式 Manager DLL 构建，生成的测试日志可以删除。
+第一条编译基础示例 `sdk/examples/bin/applepie_example.dll`、配置示例 `applepie_config_example.dll`，以及跨插件服务示例 `applepie_service1.dll`（提供方）和 `applepie_service0.dll`（使用方）；没有配置编译环境时脚本尝试通过 vswhere 寻找 MSVC。第二条还会编译并运行[离线验证宿主](examples/verify.cpp)和[配置验证](examples/config_verify.cpp)，链接本仓库真实 Core 与 MinHook 后端，在独立进程中加载示例 DLL。它不启动游戏、不部署文件，也不向其他进程注入。单独分发 SDK 时，普通示例构建只需 SDK 头文件及示例源码；`/verify` 另外需要本仓库的 `src/`、MinHook 依赖，以及示例目录中的 `abi_verify.c`、`hook_thunks.asm`（由 MSVC 的 `ml64` 编译）。这些验证源码不参与正式 Manager DLL 构建，生成的测试日志可以删除。
 
 旧插件迁移时，先保留地址解析、准确函数签名和业务回调，将初始化移到 Enable，再把安装流程换成下面的客户端接口。游戏状态恢复及后台任务取消由插件实现。
 
@@ -30,6 +30,7 @@ sdk\examples\build.bat /verify
 | 接口 | 负责的流程 |
 |---|---|
 | `Client::Attach / Service<T>` | 校验 ABI、保存 owner、按需获取服务表；失败不覆盖已有输出表 |
+| `Config::Register / Notify / Status / Read / Save` | 注册基础字段与保存完成通知，读取快照、异步保存；应用配置由插件自己负责 |
 | `NativeHook<Tag, Function>` | 准确签名入口与普通独占 Hook 的申请、准备、original 发布、激活和状态查询 |
 | `Hook` | 插件提供手写入口时的安装流程，保留特殊 ABI 和控制逻辑 |
 | `SharedHook` | 任意自定义合约的共享申请，区分 provider/member 并完成激活 |
@@ -82,6 +83,35 @@ r = Smc::Advance(); // Pending 时稍后再推进，OK 才完成。
 
 分发返回错误时，适配器沿用 native SEH 故障边界并向外传播，不静默继续业务，也不重放 original；发生在 BEFORE 时尚未调用 original，发生在 AFTER 时保留已经调用一次的事实。
 
+## 可选基础配置
+
+`APH_SERVICE_CONFIG` / `APH_ConfigApi` v1 提供开关、32 位整数、小数、枚举、单行短文本和按键。字段和枚举选项使用动态列表，没有固定数量上限。插件可以只把简单设置交给 Manager；复杂文件、分组、条件联动、自定义界面和配置迁移继续由插件处理。
+
+快捷键声明为 `APH_CONFIG_KEY`，默认值和快照使用 `integer` 保存单个 Windows VK（0 表示未绑定，范围 0..255），无需声明数值范围。Manager 显示键名，点击后按键录入，Esc 取消，清除可解除绑定；录入成功后自动保存并通知插件。捕获使用面板窗口的键盘消息，失焦取消、忽略持键重复，并避免录入 Home 时触发面板开关。此类型不注册全局热键，按键响应仍由插件处理。文件继续存储十进制键值，原有整数键位可直接读取；声明此类型需要配套支持按键字段的 Manager，旧 Config 实现会拒绝未知类型。
+
+完整可编译示例见 [config_plugin.cpp](examples/config_plugin.cpp)。C++ 使用 `applepie::Config`；C 或其他语言通过 `copy_service` 获取服务表。它是可选的新服务，未改变 ABI 1.1 的已有布局；旧 Manager 可能返回 `APH_E_UNAVAILABLE`，插件应明确处理缺少服务或使用自己的默认配置。
+
+1. 在 `APH_Attach` 或初始化 worker 中调用一次 `register_schema`。字段声明稳定 `key`、标签、说明、类型及默认值；整数/小数声明包含端点的范围，文本声明最大 UTF-8 字节数，枚举提供稳定选项字符串。注册会复制全部内容并读取磁盘，不在游戏 Hook 或渲染回调中注册。
+2. `snapshot(..., 0, NULL)` 只读取字段数、修订号和保存状态；按 `field_count` 分配值数组后再次读取完整快照。字段顺序在本次进程中不变，schema、值和枚举选项不向调用方转移内存所有权。`field()` 的 `options` 返回 NULL；用 `option()` 按索引复制选项。
+3. 注册后、首次保存前，用 `set_notifier(owner, callback, context)`（C++ 为 `Config::Notify`）登记一次保存完成通知，再主动读取一次初始快照。回调签名为 `void APH_CALL(APH_Owner, void*)`；在通知中读取最新快照并更新插件自己的缓存或唤醒工作线程。业务循环直接读取本地缓存，不定时查询配置修订号。
+4. `save(owner, revision, count, values)` 提交完整事务并复制输入。返回 Pending 后，成功或失败都会触发完成通知；成功写盘后才整体发布新值并递增修订号。通知只表示有保存完成，后续保存可能已经开始，因此读取的是当前快照。保存中返回 Busy，旧修订号返回 Stale；同步拒绝不会发通知。不要在游戏回调中等待保存。
+
+通知是可选的模块期能力：需要 Manifest 声明 `APH_PLUGIN_MODULE_OBSERVER`，回调须位于本 owner 的 DLL，回调及 context 保留到进程退出。通知在保存 worker 上按 owner 串行执行，不持有配置状态或注册表锁；可重新读取快照，不能等待另一条通知、调用游戏方法或从 ABI 抛出异常。插件在正常游戏阶段应用缓存和完成旧动作恢复。通知不授予游戏访问、角色或写入权限，逻辑停用期间仍可更新纯配置缓存；不提供热卸载、通知替换或注销。通知入口有 SEH 与模块在途计数，故障 owner 不再收到后续通知。
+
+`set_notifier` 是 v1 表尾的可选扩展；原 48 字节前缀继续兼容。新客户端连接旧配置服务时，该成员为 NULL，`Config::Notify` 返回 Unavailable。依赖通知的插件应明确检查此能力，不能退回定时查询。
+
+Manager 位于游戏设置菜单的 **Applepie Manager** 页签。插件条目中的按键、开关、枚举和恢复默认值操作完成后自动保存；文字和数值在原生输入弹窗确认后保存。保存中暂停该插件的配置编辑；失败显示具体错误和仍然生效的旧值，重新编辑可再次提交，不定时重试。保存使用线程池任务，磁盘 I/O 不在 GUI、游戏回调或 Core 控制线程上执行。逻辑停用后仍可编辑已注册配置，再次启用读取最新快照；磁盘保存使用宿主复制的数据，完成后才调用可选通知，与插件业务 epoch 无关。
+
+原生界面复用 `GameSettingCtrl` 的页签、开关、下拉框、按钮及通用输入弹窗。Manager 校验 `LuaManager.LoadLua(System.String)`、`Tick(System.Single)` 和 `DoString(System.String)` 的运行时原型后，通过 Core 安装内部入口；窗口路由录入按键，异步状态/保存完成只设置通知标记，游戏线程按事件更新界面。空闲帧不读取配置快照或执行界面 Lua。脚本嵌入 DLL，无独立 ImGui 窗口；这是 Manager 内部界面实现，插件 SDK/配置 ABI 保持不变。
+
+持久文件位于**插件 DLL 所在目录的 `config/applepie.<插件ID>.ini`**，以 UTF-8 `key=value` 保存，文本首尾空格和等号会保留。缺少值使用默认值；类型/范围不合法的已有值按字段回退，并通过 `defaulted_fields` 返回数量。结构损坏、重复 key、非法 UTF-8 或读取失败会拒绝注册并保留原文件。保存先写同目录临时文件再替换；失败保留旧文件、旧值和修订号，返回 `APH_E_IO` 与 Win32 错误，详情可在 Diagnostics 中查看。未知 key 会保留，注释不作为持久状态保留。运行时不监听文件变化，菜单的“刷新状态”读取当前内存快照；外部文件修改在下次启动时读取。
+
+Manager 自身使用同一配置读写实现，文件为 `plugin/config/applepie.manager.ini`，模板位于 [`templates/config/applepie.manager.ini`](../templates/config/applepie.manager.ini)。`manager` 是此文件保留的配置 ID，业务插件不能用该 ID 注册配置。语言和 UID 选项为扁平字段，插件启动偏好为 `plugin.<小写 DLL 文件名>=true/false`。旧的分节 TXT 配置仅在新文件缺失时导入一次，新文件始终优先；旧文件保持原样，之后不再写入。启动时读取一次，游戏内修改通过异步保存写回，无文件轮询。
+
+键为 1..47 个 ASCII 字母、数字、点、下划线或连字符；标签/说明分别最多 95/159 个 UTF-8 字节，枚举值最多 63 字节，短文本最多 255 字节。字符串必须 NUL 结尾，不接受换行、控制字符或非法 UTF-8；数值不接受 NaN/Infinity。枚举按字符串持久化，调整选项顺序不会改变已保存的含义。字段及选项总数按实际需要分配，资源不足时返回错误。
+
+配置 C ABI 布局：`APH_ConfigValue=272`、`APH_ConfigOption=64`、`APH_ConfigField=616`、`APH_ConfigSchema=16`、`APH_ConfigSnapshot=32`、`APH_ConfigApi=56` 字节（原 v1 前缀 48 字节）；仍为 Windows x64、pack 8。
+
 ## 服务入口与 ABI
 
 | 服务 ID | 表 | 用途 |
@@ -95,6 +125,7 @@ r = Smc::Advance(); // Pending 时稍后再推进，OK 才完成。
 | `APH_SERVICE_WRITES` | `APH_WriteApi` | Animation / Camera 写权 |
 | `APH_SERVICE_PLUGINS` | `APH_PluginServiceApi` | 版本化跨插件同步服务 |
 | `APH_SERVICE_DIAGNOSTICS` | `APH_DiagnosticsApi` | 错误详情查询与上报 |
+| `APH_SERVICE_CONFIG` | `APH_ConfigApi` | 可选基础配置、内存快照与异步持久化 |
 
 关键 x64 布局：`APH_Api=48`、`APH_HookApi=72`、`APH_HookRequest=240`、`APH_LifecycleApi=56`、`APH_WriteApi=56`、`APH_LifecycleDesc=32`、`APH_Cleanup=48`、`APH_WriteRequest=40`、`APH_WriteStatus=56`、`APH_WriteCall=32` 字节。
 
@@ -124,13 +155,13 @@ Core 同时计入使用方和提供方的在途调用，停用关闭新调用并
 
 ## 错误详情与日志
 
-面板显示结果名称、失败阶段、依赖原因及 Win32 错误；已 Attach 插件可展开 Last error，查看 Hook/资源、目标地址和后端状态。SDK 的 `APH_DiagnosticsApi::last_error` 读取最近错误，`report` 供插件补充自己的初始化/业务阶段。日志与详情只用于诊断，不代替 Hook 状态和 owner 状态的判断。异常码、地址、阶段和线程继续从 `APH_OwnerStatus` 获取；SEH 过滤器不做文件 I/O。
+面板显示结果名称、失败阶段、依赖原因及 Win32 错误；点击插件状态行可查看 Hook/资源、目标地址和后端状态。SDK 的 `APH_DiagnosticsApi::last_error` 读取最近错误，`report` 供插件补充自己的初始化/业务阶段。日志与详情只用于诊断，不代替 Hook 状态和 owner 状态的判断。异常码、地址、阶段和线程继续从 `APH_OwnerStatus` 获取；SEH 过滤器不做文件 I/O。
 
 `plugin/applepie_core.log` 和 `plugin/applepie_manager_log.txt` 各保留当前文件及 `.1`、`.2`、`.3`，新写入文件每份上限 1 MiB（升级前已有的大文件保留原样，随轮换淘汰）。启动时保留上次非空日志，写满时继续轮换，记录带本地时间。文件占用/权限导致轮换失败时停止该实例的文件写入并发出 OutputDebugString 提示，保留当前日志，不截断旧证据；历史编号可能出现空缺。
 
 ## Manager 的 IL2CPP 边界
 
-内置 UID 功能与面板独立初始化：先安装共享 shutdown 保护，等 corlib 与既有 VM 线程出现后才 domain_get/attach；只在元数据工作期间附加自己创建的线程，随后 detach。可选 [Il2CppBootstrap](applepie_il2cpp.h) 提供这一流程的基础函数，采用它的插件仍需核对目标游戏构建的无分配探针及初始化顺序，并提供退出互斥。
+内置 UID 与原生设置共用受保护的 VM 启动边界：先安装共享 shutdown 保护，等 corlib 与既有 VM 线程出现后才 domain_get/attach；只在元数据工作期间附加自己创建的线程，随后 detach。可选 [Il2CppBootstrap](applepie_il2cpp.h) 提供这一流程的基础函数，采用它的插件仍需核对目标游戏构建的无分配探针及初始化顺序，并提供退出互斥。
 
 面板仅提交标量设置；UID 查找、SetActive、字符串和 GC handle 操作在实际 TMP 回调中执行，并核对 Unity 窗口所属线程。退出共享回调关闭准入并等待元数据/业务区间退出；CoreReady、窗口存在和导出地址本身均不作为 GC 已就绪的证明。独立测试只能检查这些边界与调用顺序，真实游戏的 ABI、时序和隐藏效果仍须实测。
 
@@ -300,7 +331,7 @@ EIEM 的晚安装组先提交请求，在 resident worker 上保存 original、�
 
 ## 状态、容量和诊断
 
-`owner_status` 给出状态、epoch、受管业务/生命周期在途数、首个故障记录、保留资源数量；`query_hook` 给出准备/启用/释放状态、original、native 在途数、MinHook 返回码。面板分别显示 Loaded、Attached、Capabilities 和实际状态。复选框更改下次启动配置；独立的启用/停用按钮异步更改本次运行状态，准备和排空期间显示进行中。
+`owner_status` 给出状态、epoch、受管业务/生命周期在途数、首个故障记录、保留资源数量；`query_hook` 给出准备/启用/释放状态、original、native 在途数、MinHook 返回码。面板分别显示 Loaded、Attached、Capabilities 和实际状态。“启用插件”统一开关异步请求本次启停，请求被接受后自动保存相同的下次启动偏好；请求被拒绝时保留原偏好并显示错误。只有 Active 显示绿色，其他状态显示红色，准备和排空期间保留实际状态名称。
 
 基础服务上限为 64 owner、128 native claim、128 notice subscription、同线程 32 层受管 native 入口。模块/native claim 不复用；对已关闭且排空的同 owner 通知、共享订阅和窗口路由槽使用代际句柄复用，旧 ID 仍被拒绝。申请耗尽返回 QueueFull。故障清理标志独立于新增申请容量。深递归超过 SDK 计数栈时不再分发业务，original 仍依赖永久保留的 trampoline。日志写到 `plugin/applepie_core.log` 和 OutputDebugString，记录操作、owner、claim、target、模式、key、结果；异常过滤器不写日志。Core 与 Manager 的文件日志均按[错误详情与日志](#错误详情与日志)中的规则轮换。
 
@@ -319,6 +350,6 @@ Core 只管理已接入的 Hook、通知、PointerPatch、窗口路由、游戏�
 
 ## 版本与发行
 
-消费方可自行记录 SDK 版本和头文件 SHA256；`applepie-sdk.lock.json` 是可选记录，Manager 和本 SDK 示例构建不读取或强制校验它。消费方自己的构建或验证脚本可以检查该文件，升级 SDK 时应同步更新其记录。Manifest 的 `required_minor` 按实际需要的 ABI 填写，不使用管理器的 `0.2.0` 发布版本；使用 `APH_PluginInfo` 或要求新增服务可用的插件应声明 ABI 1.1。
+消费方可自行记录 SDK 版本和头文件 SHA256；`applepie-sdk.lock.json` 是可选记录，Manager 和本 SDK 示例构建不读取或强制校验它。消费方自己的构建或验证脚本可以检查该文件，升级 SDK 时应同步更新其记录。Manifest 的 `required_minor` 按实际需要的 ABI 填写，不使用管理器的 `0.2.1` 发布版本；使用 `APH_PluginInfo` 或要求新增服务可用的插件应声明 ABI 1.1。
 
 升级时验证准确 native ABI、恢复时机、旧 epoch/目标命令失效，以及目标游戏内的插件共存行为。未声明并登记生命周期服务的客户端仍可使用基础加载与 Hook，但不开放运行中首次加载/启停。DLL 升级需要重启进程。

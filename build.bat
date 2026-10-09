@@ -55,26 +55,15 @@ if errorlevel 1 exit /b 1
 echo [2/4] Building applepie_manager.dll ...
 cl /nologo /utf-8 /O2 /MT /LD /EHsc /std:c++17 ^
     /Ideps\minhook_lib\include ^
-    /Ideps\imgui ^
     src\applepie_manager.cpp ^
     src\hub_core.cpp ^
     src\hub_shared.cpp src\hub_runtime.cpp src\hub_pointers.cpp src\hub_windows.cpp ^
-    src\hub_lifecycle.cpp ^
+    src\hub_lifecycle.cpp src\hub_config.cpp ^
     src\manager_loader.cpp ^
-    deps\imgui\imgui.cpp ^
-    deps\imgui\imgui_draw.cpp ^
-    deps\imgui\imgui_tables.cpp ^
-    deps\imgui\imgui_widgets.cpp ^
-    deps\imgui\imgui_impl_win32.cpp ^
-    deps\imgui\imgui_impl_dx11.cpp ^
     bin\version.res ^
     deps\minhook_lib\lib\libMinHook.x64.lib ^
     user32.lib ^
     comctl32.lib ^
-    gdi32.lib ^
-    d3d11.lib ^
-    dxgi.lib ^
-    dwmapi.lib ^
     ole32.lib ^
     /Fo"bin\\" ^
     /Fe"bin\applepie_manager.dll" ^

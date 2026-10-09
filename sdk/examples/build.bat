@@ -23,6 +23,9 @@ cl /nologo /utf-8 /O2 /MT /LD /EHsc /std:c++17 /W4 /wd4505 minimal_plugin.cpp ^
     /Fo:bin\minimal_plugin.obj /Fe:bin\applepie_example.dll /link /INCREMENTAL:NO /OPT:NOICF
 if errorlevel 1 exit /b 1
 echo [OK] %CD%\bin\applepie_example.dll
+cl /nologo /utf-8 /O2 /MT /LD /EHsc /std:c++17 /W4 /wd4505 config_plugin.cpp ^
+    /Fo:bin\config_plugin.obj /Fe:bin\applepie_config_example.dll /link /INCREMENTAL:NO
+if errorlevel 1 exit /b 1
 for %%i in (0 1) do (
     cl /nologo /utf-8 /O2 /MT /LD /EHsc /std:c++17 /W4 /wd4505 /DSERVICE_PROVIDER=%%i service_plugin.cpp ^
         /Fo:bin\service%%i.obj /Fe:bin\applepie_service%%i.dll /link /INCREMENTAL:NO
@@ -39,11 +42,22 @@ if errorlevel 1 exit /b 1
 cl /nologo /utf-8 /O2 /MT /EHsc /std:c++17 /W4 /wd4505 /I..\..\deps\minhook_lib\include ^
     verify.cpp bin\hook_thunks.obj ..\..\src\hub_core.cpp ..\..\src\hub_shared.cpp ^
     ..\..\src\hub_runtime.cpp ..\..\src\hub_pointers.cpp ^
-    ..\..\src\hub_windows.cpp ..\..\src\hub_lifecycle.cpp ^
+    ..\..\src\hub_windows.cpp ..\..\src\hub_lifecycle.cpp ..\..\src\hub_config.cpp ^
     ..\..\deps\minhook_lib\lib\libMinHook.x64.lib user32.lib comctl32.lib ^
     /Fo"bin\\" /Fe:bin\sdk_verify.exe /link /INCREMENTAL:NO /OPT:NOICF /LTCG
 if errorlevel 1 exit /b 1
 bin\sdk_verify.exe
 if errorlevel 1 exit /b 1
 bin\sdk_verify.exe entry-changed
-exit /b %errorlevel%
+if errorlevel 1 exit /b 1
+cl /nologo /utf-8 /O2 /MT /EHsc /std:c++17 /W4 /wd4505 /I..\..\deps\minhook_lib\include ^
+    config_verify.cpp bin\hub_core.obj bin\hub_shared.obj bin\hub_runtime.obj ^
+    bin\hub_pointers.obj bin\hub_windows.obj bin\hub_lifecycle.obj bin\hub_config.obj ^
+    ..\..\deps\minhook_lib\lib\libMinHook.x64.lib user32.lib comctl32.lib ^
+    /Fo:bin\config_verify.obj /Fe:bin\config_verify.exe /link /INCREMENTAL:NO /LTCG
+if errorlevel 1 exit /b 1
+for %%i in (behavior persistence corrupt plugin notifications hotkeys hotkeys-reload) do (
+    bin\config_verify.exe %%i
+    if errorlevel 1 exit /b 1
+)
+exit /b 0

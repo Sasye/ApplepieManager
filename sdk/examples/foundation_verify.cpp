@@ -167,10 +167,91 @@ static void UidStop() {
 }
 static unsigned Plugin(const char* id){for(unsigned i=0;i<loader::count();++i){loader::Plugin p{};loader::snapshot(i,&p);if(!strcmp(p.manifest.id,id))return i;}CHECK(false);return 0;}
 static loader::Plugin State(const char* id){loader::Plugin p{};CHECK(loader::snapshot(Plugin(id),&p));return p;}
-static void Loader(bool delayed) {
+static void ManagerConfig() {
+    wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH); *wcsrchr(exe, L'\\') = 0;
+    const auto root = std::wstring(exe) + L"\\manager-config-fixture-" + std::to_wstring(GetCurrentProcessId());
+    CHECK(CreateDirectoryW(root.c_str(), nullptr));
+    auto write = [](const std::wstring& path, const std::string& contents) {
+        std::ofstream file(path, std::ios::binary | std::ios::trunc);
+        CHECK(file.good()); file << contents; file.close(); CHECK(!file.fail());
+    };
+    auto read = [](const std::wstring& path) {
+        std::string contents; CHECK(config_file::read(path, contents) == ERROR_SUCCESS); return contents;
+    };
+    auto cfg = manager_config::load(root.c_str());
+    CHECK(!cfg.load_error && !cfg.save_error && !cfg.migrated);
+    CHECK(cfg.values == manager_config::defaults());
+    config_file::Values templateValues;
+    CHECK(config_file::parse(read(std::wstring(exe) + L"\\..\\..\\..\\..\\templates\\config\\applepie.manager.ini"), templateValues) == ERROR_SUCCESS);
+    CHECK(templateValues == cfg.values);
+    CHECK(manager_config::plugin_enabled(cfg, L"Unlisted.dll"));
+    const auto fresh = read(cfg.path);
+    CHECK(fresh.find("hide_uid=true\n") != std::string::npos && fresh.find('[') == std::string::npos);
+
+    const auto oldPath = root + L"\\applepie_manager_config.txt";
+    const std::string old = "\xEF\xBB\xBF# Old config\r\ntoggle_key=HOME\r\ndebug_log=1\r\n"
+        "[general]\r\nlanguage=en\r\n[uid]\r\nhide_uid=0\r\nhide_ping=1\r\n"
+        "[plugins]\r\nMixed Case.dll=0\r\nexample.dll=0\r\nexample.dll=1\r\n";
+    write(oldPath, old); CHECK(DeleteFileW(cfg.path.c_str()));
+    cfg = manager_config::load(root.c_str());
+    CHECK(cfg.migrated && !cfg.load_error && !cfg.save_error && cfg.values.at("language") == "en");
+    CHECK(!manager_config::boolean(cfg, "hide_uid", true) && manager_config::boolean(cfg, "hide_ping", false));
+    CHECK(!manager_config::plugin_enabled(cfg, L"Mixed Case.dll") && !manager_config::plugin_enabled(cfg, L"EXAMPLE.DLL"));
+    CHECK(read(oldPath) == old);
+    const auto migrated = read(cfg.path);
+    CHECK(migrated.find("plugin.mixed case.dll=false\n") != std::string::npos);
+    CHECK(migrated.find("toggle_key") == std::string::npos && migrated.find("debug_log") == std::string::npos);
+    CHECK(migrated.find('[') == std::string::npos);
+
+    write(oldPath, "[plugins]\nexample.dll=1\n");
+    cfg.values["language"] = "zh"; cfg.values["future.option"] = "  keep = text  ";
+    CHECK(manager_config::save(cfg) == ERROR_SUCCESS);
+    cfg = manager_config::load(root.c_str());
+    CHECK(!cfg.migrated && cfg.values.at("language") == "zh" && !manager_config::plugin_enabled(cfg, L"example.dll"));
+    CHECK(cfg.values.at("future.option") == "  keep = text  ");
+    const auto before = read(cfg.path);
+    HANDLE held = CreateFileW(cfg.path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    CHECK(held != INVALID_HANDLE_VALUE); cfg.values["language"] = "en";
+    CHECK(manager_config::save(cfg) != ERROR_SUCCESS); CHECK(CloseHandle(held));
+    CHECK(read(cfg.path) == before);
+    WIN32_FIND_DATAW entry{};
+    HANDLE temporary = FindFirstFileW((cfg.path + L".tmp.*").c_str(), &entry);
+    CHECK(temporary == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND);
+
+    for (const auto& invalid : {std::string("language=en\nlanguage=zh\n"), std::string("[plugins]\nexample.dll=1\n"),
+                               std::string("language=\xFF\n")}) {
+        write(cfg.path, invalid); cfg = manager_config::load(root.c_str());
+        CHECK(cfg.load_error == ERROR_INVALID_DATA && !cfg.migrated);
+        CHECK(!manager_config::plugin_enabled(cfg, L"example.dll"));
+        CHECK(manager_config::save(cfg) == ERROR_INVALID_DATA && read(cfg.path) == invalid);
+    }
+    CHECK(DeleteFileW(cfg.path.c_str()));
+    CHECK(RemoveDirectoryW(cfg.directory.c_str()));
+    write(cfg.directory, "blocks directory creation");
+    write(oldPath, old);
+    cfg = manager_config::load(root.c_str());
+    CHECK(!cfg.load_error && cfg.save_error && !manager_config::plugin_enabled(cfg, L"example.dll"));
+    CHECK(read(oldPath) == old);
+    CHECK(DeleteFileW(cfg.directory.c_str()));
+    cfg = manager_config::load(root.c_str());
+    CHECK(!cfg.load_error && !cfg.save_error && !manager_config::plugin_enabled(cfg, L"example.dll"));
+    CHECK(DeleteFileW(cfg.path.c_str())); CHECK(DeleteFileW(oldPath.c_str()));
+    CHECK(RemoveDirectoryW(cfg.directory.c_str())); CHECK(RemoveDirectoryW(root.c_str()));
+    puts("PASS Manager config: defaults, legacy import, new-file precedence, disabled preferences, unknown values, failed-save preservation and malformed files");
+}
+static void Loader(bool delayed, bool legacy = false) {
     wchar_t path[MAX_PATH];GetModuleFileNameW(nullptr,path,MAX_PATH);*wcsrchr(path,L'\\')=0;
-    wchar_t config[MAX_PATH];swprintf_s(config,L"%s\\plugin\\applepie_manager_config.txt",path);
-    FILE* f=nullptr;CHECK(!_wfopen_s(&f,config,L"wb"));fprintf(f,"[plugins]\nfixture8.dll=%d\nfixture11.dll=0\n",delayed?0:1);fclose(f);
+    const auto pluginPath = std::wstring(path) + L"\\plugin";
+    auto cfg = manager_config::load(pluginPath.c_str()); CHECK(!cfg.load_error && !cfg.save_error);
+    cfg.values = manager_config::defaults();
+    cfg.values["plugin.fixture8.dll"] = delayed ? "false" : "true";
+    cfg.values["plugin.fixture11.dll"] = "false";
+    CHECK(manager_config::save(cfg) == ERROR_SUCCESS);
+    if (legacy) {
+        CHECK(DeleteFileW(cfg.path.c_str()));
+        std::ofstream f(pluginPath + L"\\applepie_manager_config.txt", std::ios::binary | std::ios::trunc);
+        CHECK(f.good()); f << "[plugins]\nfixture8.dll=0\nfixture11.dll=0\n"; f.close(); CHECK(!f.fail());
+    }
     CHECK(APH_Bootstrap(1)>=0);
     Await([]{APH_BootStatus b{};return APH_GetBootStatus(sizeof(b),&b)==APH_OK&&b.state==APH_SCANNED;});
     Await([]{return State("fixture.9").state==loader::Active;});
@@ -215,9 +296,10 @@ static void Loader(bool delayed) {
 }
 static void AttachLoss() {
     wchar_t path[MAX_PATH];GetModuleFileNameW(nullptr,path,MAX_PATH);*wcsrchr(path,L'\\')=0;
-    wchar_t config[MAX_PATH];swprintf_s(config,L"%s\\plugin\\applepie_manager_config.txt",path);
-    FILE* f=nullptr;CHECK(!_wfopen_s(&f,config,L"wb"));fprintf(f,"[plugins]\n");
-    for(unsigned i=1;i<=11;++i)fprintf(f,"fixture%u.dll=%u\n",i,i==8||i==11?1:0);fclose(f);
+    auto cfg = manager_config::load((std::wstring(path) + L"\\plugin").c_str()); CHECK(!cfg.load_error && !cfg.save_error);
+    cfg.values = manager_config::defaults();
+    for(unsigned i=1;i<=11;++i)cfg.values["plugin.fixture" + std::to_string(i) + ".dll"] = i==8||i==11 ? "true" : "false";
+    CHECK(manager_config::save(cfg) == ERROR_SUCCESS);
     CHECK(APH_Bootstrap(1)>=0);
     Await([]{APH_BootStatus b{};return APH_GetBootStatus(sizeof(b),&b)==APH_OK&&b.state==APH_SCANNED;});
     Await([]{return State("fixture.8").state==loader::Disabled;});
@@ -229,7 +311,9 @@ static void AttachLoss() {
     puts("PASS loader attach race: provider lost during Attach, unstarted dependent waits and resumes when provider recovers");
 }
 int main(int argc,char** argv) {
-    if(argc>1&&!strcmp(argv[1],"loader-attach-loss"))AttachLoss();
+    if(argc>1&&!strcmp(argv[1],"manager-config"))ManagerConfig();
+    else if(argc>1&&!strcmp(argv[1],"loader-legacy"))Loader(true, true);
+    else if(argc>1&&!strcmp(argv[1],"loader-attach-loss"))AttachLoss();
     else if(argc>1&&!strncmp(argv[1],"loader",6))Loader(!strcmp(argv[1],"loader-delayed"));
     else {CHECK(hub::initialize()==APH_OK);if(argc>1&&!strcmp(argv[1],"uid"))Uid();else if(argc>1&&!strcmp(argv[1],"uid-stop"))UidStop();else if(argc>1&&!strcmp(argv[1],"logs"))Logs();else Services();}
     printf("PASS foundation checks: %ld assertions\n",checks);return 0;

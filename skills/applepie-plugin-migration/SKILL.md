@@ -19,6 +19,7 @@ description: "将旧版 Windows x64 C/C++ DLL 插件迁移到 ApplepieManager / 
 | 终末地常用共享 Hook | `applepie_endfield_adapters.h`、`applepie_endfield_contracts.h` |
 | 指针槽替换 | `applepie_pointer_scope.h`，以及 `applepie.h` 中的 Pointer 服务 |
 | 游戏线程、窗口命令、游戏写入、停用恢复 | `applepie.h` 中 Runtime、Window、Write、Lifecycle 服务及 SDK 对应说明 |
+| 基础设置、快捷键、旧配置导入 | `applepie::Config`、`APH_ConfigApi`、`examples/config_plugin.cpp` 和 SDK 的可选基础配置说明 |
 
 本文以 Windows x64、MSVC C++17 客户端为基线。纯 C 或特殊入口可直接使用公开 C API。接口及限制以实际 SDK 版本为准。
 
@@ -28,13 +29,14 @@ description: "将旧版 Windows x64 C/C++ DLL 插件迁移到 ApplepieManager / 
 
 ## 先做一张操作清单
 
-读取插件入口、初始化、Hook 安装、原函数调用、线程、停用/恢复和构建依赖。搜索 `MH_`、`Detour`、`VirtualProtect`、`InterlockedExchangePointer`、`SetWindowLongPtr`、`SetWindowSubclass`、`DllMain`、`LoadLibrary`、`FreeLibrary`、线程入口及直接赋值的函数指针槽；搜索结果是线索，还要追踪真实调用链。
+读取插件入口、初始化、Hook 安装、原函数调用、线程、配置读写、热键、停用/恢复和构建依赖。搜索 `MH_`、`Detour`、`VirtualProtect`、`InterlockedExchangePointer`、`SetWindowLongPtr`、`SetWindowSubclass`、`DllMain`、`LoadLibrary`、`FreeLibrary`、线程入口及直接赋值的函数指针槽；搜索结果是线索，还要追踪真实调用链。
 
 逐项记录：目标及地址来源、真实原型、原函数调用次数/阶段、返回值及输出参数、线程局部错误状态、执行线程、读写对象、原值/恢复条件、共享需求。按以下边界迁移：
 
 | 原操作 | 迁移方式 |
 |---|---|
 | 不依赖游戏运行时的文件、网络、音频、独立 UI、纯数据运算 | 保留插件实现；若支持停用，由插件取消和排空自有任务。无需凭空引入 Runtime、Actor 或写权 |
+| 简单设置与按键配置 | 可选接入 Config 服务，由 Manager 原生设置页展示和自动保存；复杂配置和业务 UI 留在插件 |
 | 解析地址、解析 icall、直接调用函数 | 地址解析仍归插件；直接调用本身不是安装 Hook。调用游戏或托管运行时仍需核对运行时、线程和对象生命期；修改共享状态时另核对写入契约 |
 | 一般函数入口 Hook | `applepie::NativeHook<Tag, Function>` |
 | 特殊调用约定/返回 ABI、目标提前筛选、手写入口 | `applepie::Hook` 管安装，保留准确入口、业务准入及 Original proxy |
@@ -59,6 +61,20 @@ description: "将旧版 Windows x64 C/C++ DLL 插件迁移到 ApplepieManager / 
 SDK 不隐式创建线程。独立工具插件的启用不应被不相干的角色或 Runtime 就绪条件阻塞。
 
 区分模块期初始化与每次启用：检查 `once_flag`、单例锁、初始化标志、线程和取消事件的寿命。再次 Enable 不能被旧守卫短路后误报成功；旧任务排空后才重置或替换其取消事件和上下文。初始化失败或取消后，按真实可恢复状态决定能否重试。
+
+## 迁移配置与设置入口
+
+基础设置通过 C/C++ Config 服务接入游戏设置中的 **Applepie Manager → 插件 → 配置**。Manager 负责原生控件和自动保存；插件自有 HUD、复杂界面及其渲染依赖按业务保留，不需要为注册设置修改 Manager 的内部 Lua 或增加专用页签。
+
+- 选择需要接入的开关、整数、小数、枚举、短文本和按键，保留原有默认值、单位及功能含义。字段 key 和枚举值保持稳定；数值范围与文本字节限制按 SDK 声明，字段和选项按实际数量分配，不增加固定数量上限。
+- 在 Attach 或初始化 worker 中注册一次 schema。注册会读取文件，不能放在游戏/渲染回调里。模块期 `applepie::Config` 使用 `Register → Notify → Read`：首次保存前安装通知，再读取初始快照。使用通知须声明 `MODULE_OBSERVER` 及其要求的 `LIFECYCLE`，回调/context 保持模块期生命。服务或通知扩展不可用时，按功能是否必需明确报错或保留原配置入口；不以定时查询代替通知。
+- 保存完成通知在宿主 worker 上串行执行，成功和失败都会通知；只读取最新快照、更新有同步保护的插件缓存或唤醒任务。业务循环读取缓存，不每隔若干毫秒或每帧查询 revision、重读文件；游戏操作留在原有合法阶段，停用期间收到配置通知也不能重新启动业务。
+- `Save` 提交带预期 revision 的完整值数组；Pending 是已受理，成功后才发布新值。Busy 等当前提交完成，Stale 读取新快照后重新处理本次编辑，同步拒绝不等完成通知。保留失败时仍生效的旧值与错误状态，不在游戏线程等待 I/O，也不循环重试。
+- 快捷键改为 `APH_CONFIG_KEY`，快照和文件仍保存单个 Windows VK，0 表示未绑定。由 Manager 显示键名、按键录入并自动保存，插件继续负责按键响应；不要让用户输入键码。更换绑定时按原业务语义完成旧的按下/释放配对；组合键或复杂映射仍由插件实现。
+
+持久文件为插件 DLL 所在目录的 `config/applepie.<插件ID>.ini`，使用 UTF-8 扁平 `key=value`，布尔值为 `true/false`。旧插件配置由插件自行迁移：仅在新文件确实不存在时读取、校验旧值，作为首轮 schema 默认值注册，再通过 Config 服务保存；确认异步保存成功后才视为落盘完成，旧文件保留。已有新文件优先，损坏或读取失败不能当作缺失而用旧值覆盖；未知字段由 Core 保留。避免新旧文件成为两个同时写入的配置源。
+
+Manager 自身的 `plugin/config/applepie.manager.ini` 只负责语言、UID 和 `plugin.<小写 DLL 文件名>` 启动偏好，`manager` 是保留配置 ID。其模板在完整 Manager 仓库的 `templates/config/applepie.manager.ini`；旧 `applepie_manager_config.txt` 的自动导入只针对 Manager，不会替业务插件迁移配置。Manager 的启用开关同时处理本次启停和下次启动偏好，插件无需复制第二套开关。
 
 ## 迁移 Hook，保留特殊语义
 
@@ -104,7 +120,7 @@ Core 按 slot 地址登记并条件恢复，只能协调已接入者。它不能
 
 ## 实现真正可恢复的逻辑停用
 
-正常流程是 `Active → Disabling → Disabled`，DLL 常驻；更新 DLL 需重启进程。Attach 只一次，重新启用使用新 epoch 并续接业务订阅/窗口路由。
+正常流程是 `Active → Disabling → Disabled`；启用中也可通过 Lifecycle 请求取消，走 `Enabling → Disabling → Disabled`。Pending 表示已受理，Busy 不等于取消成功；仍需确认初始化和在途任务排空。DLL 常驻，更新 DLL 需重启进程。Attach 只一次，重新启用使用新 epoch 并续接业务订阅/窗口路由。
 
 - `disabling` 只取消自有任务、停止新生产、更新标量和 UI 状态。游戏对象恢复放在已验证且适合该业务的 checkpoint；无游戏资源的工具可在控制侧完成 domains=0 的恢复。
 - Core 在途计数不自动覆盖插件自有 worker、定时任务或异步 I/O。用同一锁或正确的原子协议协调任务准入、计数和关闭，不能把单次布尔检查或 `volatile` 当作排空证明；共享配置也需同步访问。取消应能唤醒初始化及周期等待，不能依赖 DllMain 卸载、强杀线程或等完整业务周期后才停用。
@@ -133,6 +149,7 @@ sdk\examples\build.bat /verify
 | 涉及改动 | 需确认的行为 |
 |---|---|
 | 加载、异步启用、后台任务 | Manifest/导出有效；晚加载能发现当前状态；启动/周期等待可取消；关闭准入与任务启动交错时仍正确排空；旧 epoch 完成被拒绝；初始化失败、停用后的再次启用符合约定 |
+| 配置与快捷键 | 旧值只在新文件缺失时导入；新文件优先、损坏不覆盖；保存失败保留旧值；按键录入后实际生效且重启保留；停用时改配置、再次启用读取最新值；业务循环没有配置轮询 |
 | 独占/手写 Hook | 实际安装、准备、原调用/返回 ABI、输出参数及适用的错误状态保持；启用、透传、停用和重入路径均不失真；原异常不重放；手动 ready、回滚和目标筛选仍有效 |
 | 共享 Hook | 已知共存组合及两种加载顺序；同址只有一个 native provider；签名/契约冲突被拒；参数、返回值、原调用次数与顺序保持；provider 停用后仍服务成员；成员续订与 controller 权限正确 |
 | 直接调用游戏/托管运行时 | 分阶段模拟模块/导出可用而 GC/线程设施尚未就绪，确认提前的 attach、对象及元数据调用为零，探测本身也安全；覆盖就绪后继续、等待中取消/退出/超时和晚加载；核对线程准入、异常通道、缓存失效及资源契约 |

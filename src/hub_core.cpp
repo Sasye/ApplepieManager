@@ -3,6 +3,7 @@
 #define NOMINMAX
 #include "hub_core.h"
 #include "hub_internal.h"
+#include "manager_events.h"
 #include "bounded_log.h"
 #include "../sdk/applepie_seh.h"
 #include "MinHook.h"
@@ -424,6 +425,7 @@ DWORD WINAPI control_thread(void*) {
                         o->runtime_gate.fetch_or(2,std::memory_order_release);
                         o->state = o->recoverable && !unknown ? APH_OWNER_FAULTED : APH_OWNER_NEEDS_RESTART;
                         o->result = o->recoverable && !unknown ? APH_E_FAULT : APH_E_NEEDS_RESTART;
+                        manager_events::notify();
                         close_owner_resources(j + 1, o->recoverable && !unknown);
                         char message[384];
                         _snprintf_s(message, sizeof(message), _TRUNCATE,
@@ -532,6 +534,15 @@ bool owner_usable(APH_Owner id) {
 bool owner_resident(APH_Owner id) {
     AcquireSRWLockShared(&registry);
     __try {return resident(owner_at(id));} __finally {ReleaseSRWLockShared(&registry);}
+}
+bool owner_identity(APH_Owner id, APH_Manifest* manifest, HMODULE* module) {
+    AcquireSRWLockShared(&registry);
+    __try {
+        auto o = owner_at(id);
+        if (!o) return false;
+        *manifest = o->manifest; *module = o->module;
+        return true;
+    } __finally { ReleaseSRWLockShared(&registry); }
 }
 bool owner_runtime_open(APH_Owner id) {
     return id&&id<=MaxOwners&&owners[id-1].runtime_gate.load(std::memory_order_acquire)==1;
@@ -649,11 +660,14 @@ APH_Owner add_owner(const APH_Manifest& manifest, HMODULE module) {
     } __finally { ReleaseSRWLockExclusive(&registry); }
 }
 void set_owner_state(APH_Owner id, uint32_t state, APH_Result result) {
+    bool changed = false;
     AcquireSRWLockExclusive(&registry);
     __try { Owner* o = owner_at(id); if (usable(o)) {
+        changed = o->state != state || o->result != result;
         if(APH_OwnerHasFault(state))o->runtime_gate.fetch_or(2,std::memory_order_release);
         o->state = state; o->result = result; } }
     __finally { ReleaseSRWLockExclusive(&registry); }
+    if (changed) manager_events::notify();
 }
 uint64_t start_enable(APH_Owner id) {
     uint64_t epoch = 0;
@@ -684,6 +698,7 @@ bool commit_enable(APH_Owner id, uint64_t epoch, APH_Result result) {
         accepted = true;
     } __finally { ReleaseSRWLockExclusive(&registry); }
     SetEvent(wake_event);
+    manager_events::notify();
     return accepted;
 }
 void fail_owner(APH_Owner id, APH_Result result) {
@@ -698,6 +713,7 @@ void fail_owner(APH_Owner id, APH_Result result) {
         }
     } __finally { ReleaseSRWLockExclusive(&registry); }
     SetEvent(wake_event);
+    manager_events::notify();
 }
 APH_Result attach(APH_Owner id, APH_AttachFn fn) {
     APH_AttachArgs args{sizeof(args), 0, id, &core_api};

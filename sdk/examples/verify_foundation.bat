@@ -17,12 +17,12 @@ for /l %%i in (1,1,11) do (
 cl /nologo /utf-8 /O2 /MT /EHsc /std:c++17 /W4 /wd4505 /I..\..\deps\minhook_lib\include ^
     foundation_verify.cpp ..\..\src\hub_core.cpp ..\..\src\hub_shared.cpp ^
     ..\..\src\hub_runtime.cpp ..\..\src\hub_pointers.cpp ..\..\src\hub_windows.cpp ^
-    ..\..\src\hub_lifecycle.cpp ..\..\src\manager_loader.cpp ^
+    ..\..\src\hub_lifecycle.cpp ..\..\src\hub_config.cpp ..\..\src\manager_loader.cpp ^
     ..\..\deps\minhook_lib\lib\libMinHook.x64.lib user32.lib comctl32.lib ^
     /Fo"bin\foundation\\" /Fe:bin\foundation\foundation_verify.exe /link /INCREMENTAL:NO /OPT:NOICF /LTCG
 if errorlevel 1 exit /b 1
 pushd bin\foundation
-for %%i in (services logs uid uid-stop loader loader-delayed loader-attach-loss) do (
+for %%i in (services logs uid uid-stop manager-config loader loader-delayed loader-legacy loader-attach-loss) do (
     foundation_verify.exe %%i
     if errorlevel 1 (popd & exit /b 1)
 )

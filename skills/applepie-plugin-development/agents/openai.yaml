@@ -1,0 +1,3 @@
+interface:
+  display_name: "Applepie 插件开发"
+  short_description: "开发终末地插件，按功能接入 Applepie SDK 并完成生命周期、性能与行为验证"

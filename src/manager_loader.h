@@ -1,5 +1,6 @@
 #pragma once
 #include "hub_core.h"
+#include "manager_config.h"
 #include "../sdk/applepie.h"
 namespace loader {
 enum State { Disabled, Dependency, Rejected, Duplicate, LoadFailed, Loaded,
@@ -20,6 +21,7 @@ struct Plugin {
 unsigned count();
 bool snapshot(unsigned index, Plugin*);
 const wchar_t* directory();
+const manager_config::Settings& initial_config(); // Immutable after startup; menu edits its own copy.
 const char* state_name(uint32_t state);
 APH_Result request_enabled(unsigned index,bool enabled); // UI enqueues; never loads/waits here
 void start_features(); // production Manager UI; headless test implementation does nothing

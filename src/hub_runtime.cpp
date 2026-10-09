@@ -137,6 +137,13 @@ APH_Result copy_extension(APH_Owner owner,uint64_t service,uint32_t major,uint32
     if(service==APH_SERVICE_WRITES)return hub::services::output(bytes,(APH_WriteApi*)out,*hub::services::write_api());
     if(service==APH_SERVICE_PLUGINS)return hub::services::output(bytes,(APH_PluginServiceApi*)out,*hub::services::plugin_api());
     if(service==APH_SERVICE_DIAGNOSTICS)return hub::services::output(bytes,(APH_DiagnosticsApi*)out,*hub::services::diagnostics_api());
+    if(service==APH_SERVICE_CONFIG) {
+        if(bytes<APH_CONFIG_API_V1_PREFIX_BYTES)return APH_E_ABI;
+        auto value=*hub::services::config_api();
+        const size_t copied=bytes<sizeof(value)?APH_CONFIG_API_V1_PREFIX_BYTES:sizeof(value);
+        value.size=(uint32_t)copied;
+        return hub::copy(out,&value,copied)?APH_OK:APH_E_ARGUMENT;
+    }
     return APH_E_UNAVAILABLE;
 }
 }

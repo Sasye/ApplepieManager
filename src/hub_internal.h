@@ -37,6 +37,7 @@ const APH_PointerApi* pointer_api();
 const APH_RuntimeApi* runtime_api();
 const APH_PluginServiceApi* plugin_api();
 const APH_DiagnosticsApi* diagnostics_api();
+const APH_ConfigApi* config_api();
 const APH_WindowApi* window_api();
 void shared_tick(const unsigned char* owner_failure);
 void window_tick(const unsigned char* owner_failure);
