@@ -1,6 +1,6 @@
 # Applepie SDK
 
-本文对应 **Applepie Manager v0.2.1**。管理器发布版本与 SDK ABI 独立编号；当前基础 ABI 为 **1.1**（兼容 1.0 插件），各服务版本为 1。
+本文对应 **Applepie Manager v0.2.2**。管理器发布版本与 SDK ABI 独立编号；当前基础 ABI 为 **1.1**（兼容 1.0 插件），各服务版本为 1。
 
 SDK 由 `applepie_manager.dll` 提供，全部 C 接口统一在 [applepie.h](applepie.h)。平台为 Windows x64、MSVC C11/C++17、8 字节 pack。公开边界只传固定 POD、opaque handle、函数指针和模块期 context，不传 STL/CRT 对象、C++ 异常或分配所有权。
 
@@ -55,7 +55,7 @@ slot 使用 `Client::Service<APH_PointerApi>` 获取一次表，再复用 `APH_W
 
 ## 可选终末地共享适配器
 
-`applepie_endfield_adapters.h` 提供 `applepie::endfield::SetMainI32<Tag>`、`SetMainBool<Tag>`、`BipedIK<Tag>`、`SMCUpdate<Tag>`、`MorphJob<Tag>`、`SpecialMorphJob<Tag>` 和 `CreateBindingByActionId<Tag>`。它们只处理 native 调用和事件分发，不含偏移量、反射、当前角色、线程认证或写姿态业务。
+`applepie_endfield_adapters.h` 提供 `applepie::endfield::SetMainI32<Tag>`、`SetMainBool<Tag>`、`BipedIK<Tag>`、`SMCUpdate<Tag>`、`GameAppUpdate<Tag>`、`MorphJob<Tag>`、`SpecialMorphJob<Tag>` 和 `CreateBindingByActionId<Tag>`。它们只处理 native 调用和事件分发，不含偏移量、反射、当前角色、线程认证或写姿态业务。
 
 例如，对**已验证准确原型**的 SMC Update 地址：
 
@@ -72,6 +72,8 @@ r = Smc::Advance(); // Pending 时稍后再推进，OK 才完成。
 ```
 
 首次提供适配器的插件成为 provider，其 original 在激活前保存；后来的插件只激活自己的逻辑 claim。SMC、SetMain 和 Job 保持 original 一次；BipedIK 仅允许显式登记的唯一 controller 在 BEFORE 返回 `APH_SUPPRESS`。普通 observer 没有抑制权。成员无需调用 original，也不能把借用 payload 当作游戏写权。
+
+`GameAppUpdate` 沿用 AntiKick、EndfieldVR 的 `endfield.GameApp.Update` version 1 契约：`void(self*, MethodInfo*)`，payload 为 `APH_EfVoid`，原函数执行一次。Manager 的菜单在 AFTER 阶段处理初始化和 UI 事件；使用该入口的插件应共享同一契约。
 
 `CreateBindingByActionId` 沿用 EIEM 已用的 Windows x64 IL2CPP 原型 `void*(self, actionId, callback, int32_t priority, MethodInfo*)`，按 `APH_EF_INPUT_BINDING` version 1 共享，原函数执行一次。`APH_EfInputBinding` 的 `result` 在 BEFORE 为 null，在 AFTER 是原返回值（也可能为 null）；订阅者不能改返回值或跳过原函数。监听捕获本身不要求 Animation/Camera 写权，后续调用捕获的游戏委托仍需自己的线程、生命期和业务权限判断。
 
@@ -333,13 +335,13 @@ EIEM 的晚安装组先提交请求，在 resident worker 上保存 original、�
 
 `owner_status` 给出状态、epoch、受管业务/生命周期在途数、首个故障记录、保留资源数量；`query_hook` 给出准备/启用/释放状态、original、native 在途数、MinHook 返回码。面板分别显示 Loaded、Attached、Capabilities 和实际状态。“启用插件”统一开关异步请求本次启停，请求被接受后自动保存相同的下次启动偏好；请求被拒绝时保留原偏好并显示错误。只有 Active 显示绿色，其他状态显示红色，准备和排空期间保留实际状态名称。
 
-基础服务上限为 64 owner、128 native claim、128 notice subscription、同线程 32 层受管 native 入口。模块/native claim 不复用；对已关闭且排空的同 owner 通知、共享订阅和窗口路由槽使用代际句柄复用，旧 ID 仍被拒绝。申请耗尽返回 QueueFull。故障清理标志独立于新增申请容量。深递归超过 SDK 计数栈时不再分发业务，original 仍依赖永久保留的 trampoline。日志写到 `plugin/applepie_core.log` 和 OutputDebugString，记录操作、owner、claim、target、模式、key、结果；异常过滤器不写日志。Core 与 Manager 的文件日志均按[错误详情与日志](#错误详情与日志)中的规则轮换。
+基础服务保留 64 owner、128 notice subscription、同线程 32 层受管 native 入口的限制。原生 Hook 记录按需分配，不再设 128 项或每插件数量上限；扩容不移动已发布记录，分配失败返回 QueueFull。模块/native claim 不复用；对已关闭且排空的同 owner 通知、共享订阅和窗口路由槽使用代际句柄复用，旧 ID 仍被拒绝。故障清理标志独立于新增申请容量。深递归超过 SDK 计数栈时不再分发业务，original 仍依赖永久保留的 trampoline。日志写到 `plugin/applepie_core.log` 和 OutputDebugString，记录操作、owner、claim、target、模式、key、结果；异常过滤器不写日志。Core 与 Manager 的文件日志均按[错误详情与日志](#错误详情与日志)中的规则轮换。
 
 Core 只管理已接入的 Hook、通知、PointerPatch、窗口路由、游戏写权和相关生命周期，不登记文件、网络、音频、独立 UI 或纯数据线程，不提供万能 WriteMemory。当前仅有单一全局 Animation 拥有者与独立 Camera 拥有者。DLL、provider 和已启用 trampoline 均保留到进程结束。
 
 | 资源 | 上限与复用 |
 |---|---|
-| 基础 Core | 64 owner、128 native claim，模块期记录不复用；128 notice 槽允许同 owner 已关闭且排空后带新代次复用 |
+| 基础 Core | 64 owner；native claim 按需扩展、模块期记录不复用；128 notice 槽允许同 owner 已关闭且排空后带新代次复用 |
 | Shared | 64 site、256 logical claim、256 listener；允许同 owner 已排空的 listener 槽带新代次复用；TLS 32 层，payload ≤256 字节 |
 | PointerPatch | 128 同时保留记录；恢复成功才带 generation 复用 |
 | Windows | 64 incarnation、128 route（允许同 owner 已排空的槽带新代次复用）、128 排队命令（消费后复用） |
@@ -350,6 +352,6 @@ Core 只管理已接入的 Hook、通知、PointerPatch、窗口路由、游戏�
 
 ## 版本与发行
 
-消费方可自行记录 SDK 版本和头文件 SHA256；`applepie-sdk.lock.json` 是可选记录，Manager 和本 SDK 示例构建不读取或强制校验它。消费方自己的构建或验证脚本可以检查该文件，升级 SDK 时应同步更新其记录。Manifest 的 `required_minor` 按实际需要的 ABI 填写，不使用管理器的 `0.2.1` 发布版本；使用 `APH_PluginInfo` 或要求新增服务可用的插件应声明 ABI 1.1。
+消费方可自行记录 SDK 版本和头文件 SHA256；`applepie-sdk.lock.json` 是可选记录，Manager 和本 SDK 示例构建不读取或强制校验它。消费方自己的构建或验证脚本可以检查该文件，升级 SDK 时应同步更新其记录。Manifest 的 `required_minor` 按实际需要的 ABI 填写，不使用管理器的 `0.2.2` 发布版本；使用 `APH_PluginInfo` 或要求新增服务可用的插件应声明 ABI 1.1。
 
 升级时验证准确 native ABI、恢复时机、旧 epoch/目标命令失效，以及目标游戏内的插件共存行为。未声明并登记生命周期服务的客户端仍可使用基础加载与 Hook，但不开放运行中首次加载/启停。DLL 升级需要重启进程。

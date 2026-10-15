@@ -1,33 +1,36 @@
 -- Embedded in applepie_manager.dll; runs in the game's existing Lua VM.
 -- Only Manager UI is implemented here. Plugins still use the C SDK.
 -- Return a status even before the native command bridge is available.
-for _, name in ipairs({"HL", "UIUtils", "LuaManagerInst", "UIManager", "PanelId", "GEnums", "require_ex"}) do
+for _, name in ipairs({"HL", "UIUtils", "LuaManagerInst", "UIManager", "PanelId", "GEnums", "require_ex", "Register", "MessageConst"}) do
     if not _G[name] then return "waiting:" .. name end
 end
 if not PanelId.GameSetting then return "waiting:PanelId.GameSetting" end
 
 local prefix = "@ApplepieMenu/v1/"
+local disposed = false
 local function hex(s)
     return (tostring(s):gsub(".", function(c) return string.format("%02x", string.byte(c)) end))
 end
 local function send(command)
+    if disposed then return end
     -- This reserved path is a command, not a game resource. Its return is unused.
     LuaManagerInst:LoadLua(prefix .. command)
 end
-if _G.ApplepieNativeSettings then send("ready"); return "ready" end
+if _G.ApplepieNativeSettings then
+    if _G.ApplepieNativeSettings.IsDisposed() then return "waiting:LuaEnvRecreation" end
+    _G.ApplepieNativeSettings.Ensure()
+    send("ready")
+    return "ready"
+end
 local panelModule = require_ex("UI/Panels/GameSetting/GameSettingCtrl")
 local baseModule = require_ex("UI/Panels/Base/UICtrl")
 local popup = require_ex("UI/Panels/CommonPopUp/CommonPopUpCtrl").CommonPopUpCtrl
 local itemWidget = require_ex("UI/Widgets/GameSettingItemCell")
 assert(panelModule and panelModule.GameSettingCtrl, "GameSettingCtrl unavailable")
 local ctrl = panelModule.GameSettingCtrl
-local oldBuild, oldTab = ctrl._BuildSettingDataList, ctrl._RefreshSettingTab
-local oldTabCell = ctrl._RefreshSettingTabCell
-local oldHide, oldClose, oldShow = ctrl.OnHide, ctrl.OnClose, ctrl.OnShow
-local oldPopupShow, oldPopupHide, oldPopupClose = popup._ShowPopUp, popup.OnHide, popup.OnClose
-assert(oldBuild and oldTab and oldTabCell and itemWidget.InitGameSettingItemCell and ctrl._RefreshSettingItemCell
+assert(ctrl._BuildSettingDataList and ctrl._RefreshSettingTab and ctrl._RefreshSettingTabCell and itemWidget.InitGameSettingItemCell and ctrl._RefreshSettingItemCell
     and ctrl._DropdownAdjustExpandDirection and ctrl._SetSettingItemControllerNaviTarget, "Game settings contract changed")
-assert(oldPopupShow and oldPopupHide and oldPopupClose and popup.AutoOpen, "Popup contract changed")
+assert(popup._ShowPopUp and popup.OnHide and popup.OnClose and popup.AutoOpen, "Popup contract changed")
 local tabId = "applepie_manager"
 local active, data, page = nil, nil, -1
 local chinese = true
@@ -99,7 +102,7 @@ local function showHeaderVersion(self, show)
         version.fontSize = title.fontSize * 0.6
         version.horizontalAlignment = CS.TMPro.HorizontalAlignmentOptions.Right
         version.raycastTarget = false
-        version.text = "v0.2.1"
+        version.text = "v0.2.2"
         self.view.applepieVersionText = version
     end
     if version then version.gameObject:SetActive(show) end
@@ -294,10 +297,9 @@ render = function(resetNavigation)
     end
 end
 
--- HyperLua supports reloading an existing type; preserve all original methods
--- and use the same signatures as the game's GameSettingCtrl.
-local reloading = HL.IsReloading()
+-- Keep integration tied to panel lifecycle, including module hot reloads.
 local function addTab(self)
+    if disposed then return false end
     if not self.m_tabDataList or not self.m_itemDataList then return false end
     for _, tab in ipairs(self.m_tabDataList) do if tab.tabId == tabId then return false end end
     local icon = self.m_tabDataList[1] and self.m_tabDataList[1].tabIcon or "general"
@@ -306,82 +308,152 @@ local function addTab(self)
     self.m_itemDataList[#self.m_tabDataList] = {}
     return true
 end
-HL.SetReloading(true)
-local registered, registerError = xpcall(function()
-ctrl = HL.Class("GameSettingCtrl", baseModule.UICtrl)
-ctrl._BuildSettingDataList = HL.Method() << function(self)
-    oldBuild(self)
-    addTab(self)
-end
-ctrl._RefreshSettingTabCell = HL.Method(HL.Table, HL.Number) << function(self, cell, index)
-    oldTabCell(self, cell, index)
-    local tab = self.m_tabDataList[index]
-    if tab and tab.tabId == tabId then
-        local sprite = tabSprite()
-        if sprite then
-            cell.defaultIcon.sprite = sprite
-            cell.selectedIcon.sprite = sprite
-            cell.defaultIcon.preserveAspect = true
-            cell.selectedIcon.preserveAspect = true
-        end
-    end
-end
-ctrl._RefreshSettingTab = HL.Method(HL.Number, HL.Boolean, HL.Opt(HL.Boolean)) << function(self, index, init, rebuildData)
-    local tab = self.m_tabDataList[index]
-    if tab and tab.tabId == tabId then
-        self.m_tabIndex = index
-        if active ~= self or init then
-            active = self
-            selectPage(-1)
-        else
-            render()
-        end
-    else
-        close(self)
-        oldTab(self, index, init, rebuildData)
-    end
-end
-ctrl.OnHide = HL.Override() << function(self)
-    close(self)
-    if oldHide then oldHide(self) end
-end
-ctrl.OnShow = HL.Override() << function(self)
-    if oldShow then oldShow(self) end
+local attachedPanels = setmetatable({}, {__mode = "k"})
+local function ensureTab(self)
+    if disposed then return end
     if addTab(self) then self:_InitSettingTabList() end
-    if not self.m_tabCells then return end
+    assert(self.m_tabDataList and self.m_tabCells, "GameSetting tab controls unavailable")
     for i, tab in ipairs(self.m_tabDataList) do
         if tab.tabId == tabId then
-            local cell = self.m_tabCells:Get(i)
-            if cell and cell.toggle.isOn then self.m_tabIndex = i; active = self; selectPage(-1) end
+            assert(self.m_tabCells:Get(i), "Applepie tab cell was not created")
+            if not attachedPanels[self] then attachedPanels[self] = true; send("tab-ready") end
+            return
         end
     end
+    error("Applepie tab was not added")
 end
-ctrl.OnClose = HL.Override() << function(self)
-    close(self)
-    if oldClose then oldClose(self) end
+
+local patches = {}
+local function patchMethods(className, classObject, definitions)
+    local saved = patches[className] or {}
+    patches[className] = saved
+    local pending = {}
+    for name, wrap in pairs(definitions) do
+        local current = classObject[name]
+        if current ~= saved[name] then
+            assert(type(current) == "function", className .. "." .. name .. " unavailable")
+            pending[name] = {original = current, wrap = wrap}
+        end
+    end
+    if not next(pending) then return end
+    local reloading = HL.IsReloading()
+    HL.SetReloading(true)
+    local ok, detail = xpcall(function()
+        local target = HL.Class(className, baseModule.UICtrl)
+        assert(target == classObject, className .. " type identity changed")
+        for name, entry in pairs(pending) do target[name] = entry.wrap(entry.original) end
+        HL.Commit(target)
+    end, debug.traceback)
+    HL.SetReloading(reloading)
+    if not ok then error(detail) end
+    -- HyperLua can log an error without throwing. Read back the installed methods
+    -- before acknowledging readiness, and never wrap our own previous wrapper.
+    local rejected
+    for name, entry in pairs(pending) do
+        local current = classObject[name]
+        if type(current) == "function" and current ~= entry.original then
+            saved[name] = current
+        else
+            rejected = className .. "." .. name .. " replacement failed"
+        end
+    end
+    assert(not rejected, rejected)
 end
-HL.Commit(ctrl)
--- CommonPopUp is shared by the game: restore its confirmation button after key
--- capture on every close path and before the next popup.
-popup = HL.Class("CommonPopUpCtrl", baseModule.UICtrl)
-popup._ShowPopUp = HL.Method(HL.Table) << function(self, args)
-    if restoreCaptureUI then restoreCaptureUI() end
-    oldPopupShow(self, args)
+local function installHooks()
+    ctrl = require_ex("UI/Panels/GameSetting/GameSettingCtrl").GameSettingCtrl
+    popup = require_ex("UI/Panels/CommonPopUp/CommonPopUpCtrl").CommonPopUpCtrl
+    patchMethods("GameSettingCtrl", ctrl, {
+        _BuildSettingDataList = function(original) return HL.Method() << function(self)
+            original(self)
+            addTab(self)
+        end end,
+        _RefreshSettingTabCell = function(original) return HL.Method(HL.Table, HL.Number) << function(self, cell, index)
+            original(self, cell, index)
+            local tab = self.m_tabDataList[index]
+            if not disposed and tab and tab.tabId == tabId then
+                local sprite = tabSprite()
+                if sprite then
+                    cell.defaultIcon.sprite = sprite
+                    cell.selectedIcon.sprite = sprite
+                    cell.defaultIcon.preserveAspect = true
+                    cell.selectedIcon.preserveAspect = true
+                end
+            end
+        end end,
+        _RefreshSettingTab = function(original) return HL.Method(HL.Number, HL.Boolean, HL.Opt(HL.Boolean)) << function(self, index, init, rebuildData)
+            local tab = self.m_tabDataList[index]
+            if not disposed and tab and tab.tabId == tabId then
+                self.m_tabIndex = index
+                if active ~= self or init then active = self; selectPage(-1) else render() end
+            else
+                close(self)
+                original(self, index, init, rebuildData)
+            end
+        end end,
+        OnHide = function(original) return HL.Override() << function(self)
+            close(self)
+            original(self)
+        end end,
+        OnShow = function(original) return HL.Override() << function(self)
+            original(self)
+            if disposed then return end
+            ensureTab(self)
+            for i, tab in ipairs(self.m_tabDataList) do
+                if tab.tabId == tabId then
+                    local cell = self.m_tabCells:Get(i)
+                    if cell and cell.toggle.isOn then self.m_tabIndex = i; active = self; selectPage(-1) end
+                end
+            end
+        end end,
+        OnClose = function(original) return HL.Override() << function(self)
+            close(self)
+            original(self)
+        end end
+    })
+    -- CommonPopUp is shared: restore the confirmation button on every close
+    -- path and before another popup uses it.
+    patchMethods("CommonPopUpCtrl", popup, {
+        _ShowPopUp = function(original) return HL.Method(HL.Table) << function(self, args)
+            if restoreCaptureUI then restoreCaptureUI() end
+            original(self, args)
+        end end,
+        OnHide = function(original) return HL.Override() << function(self)
+            if restoreCaptureUI then restoreCaptureUI() end
+            original(self)
+        end end,
+        OnClose = function(original) return HL.Override() << function(self)
+            if restoreCaptureUI then restoreCaptureUI() end
+            original(self)
+        end end
+    })
 end
-popup.OnHide = HL.Override() << function(self)
-    if restoreCaptureUI then restoreCaptureUI() end
-    oldPopupHide(self)
+local function ensureExisting()
+    if disposed then return end
+    installHooks()
+    local opened, existing = UIManager:IsOpen(PanelId.GameSetting)
+    if opened and existing and existing.isFinishedCreation then ensureTab(existing) end
 end
-popup.OnClose = HL.Override() << function(self)
-    if restoreCaptureUI then restoreCaptureUI() end
-    oldPopupClose(self)
+local lastPanelError
+local function panelEvent(name, opened)
+    if disposed then return end
+    if name ~= "GameSetting" and name ~= "CommonPopUp" then return end
+    local ok, detail = xpcall(function()
+        if opened then ensureExisting() else installHooks() end
+    end, debug.traceback)
+    if not ok then
+        if detail ~= lastPanelError then
+            lastPanelError = detail
+            send("panel-error/" .. hex(tostring(detail):sub(1, 768)))
+        end
+    else
+        lastPanelError = nil
+    end
 end
-HL.Commit(popup)
-end, debug.traceback)
-HL.SetReloading(reloading)
-if not registered then error(registerError) end
-_G.ApplepieNativeSettings = {
+local bridge = {
+    Ensure = ensureExisting,
+    IsDisposed = function() return disposed end,
     OnEvent = function(snapshot)
+        if disposed then return end
         if not active or snapshot.page ~= page then return end
         if snapshot.keyFinished and capturePopup then capturePopup:Hide(); capturePopup = nil end
         data = snapshot
@@ -389,7 +461,28 @@ _G.ApplepieNativeSettings = {
         render()
     end
 }
-local opened, existing = UIManager:IsOpen(PanelId.GameSetting)
-if opened and existing.isFinishedCreation and addTab(existing) then existing:_InitSettingTabList() end
+local function endSession(notifyNative)
+    if disposed then return end
+    disposed = true
+    -- The game's ON_DISPOSE_LUA_ENV may arrive before or after its own UI
+    -- cleanup. Drop references without calling an old panel or capture popup.
+    active, data, rows, capturePopup, restoreCaptureUI = nil, nil, {}, nil, nil
+    attachedPanels = setmetatable({}, {__mode = "k"})
+    for _, object in pairs({iconSprite, iconTexture}) do
+        pcall(function() CS.UnityEngine.Object.Destroy(object) end)
+    end
+    iconSprite, iconTexture = nil, nil
+    -- Terminal notification bypasses send(), which now rejects old callbacks.
+    -- Application quit has already closed the native VM access boundary.
+    if notifyNative then LuaManagerInst:LoadLua(prefix .. "session-ended") end
+end
+assert(MessageConst.ON_UI_PANEL_START_OPEN and MessageConst.ON_UI_PANEL_OPENED
+    and MessageConst.ON_DISPOSE_LUA_ENV and MessageConst.ON_APPLICATION_QUIT, "Panel lifecycle contract changed")
+Register(MessageConst.ON_UI_PANEL_START_OPEN, function(name) panelEvent(name, false) end, bridge)
+Register(MessageConst.ON_UI_PANEL_OPENED, function(name) panelEvent(name, true) end, bridge)
+Register(MessageConst.ON_DISPOSE_LUA_ENV, function() endSession(true) end, bridge)
+Register(MessageConst.ON_APPLICATION_QUIT, function() endSession(false) end, bridge)
+ensureExisting()
+_G.ApplepieNativeSettings = bridge
 send("ready")
 return "ready"

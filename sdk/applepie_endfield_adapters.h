@@ -42,6 +42,15 @@ struct SMCUpdateSpec {
     static constexpr uint32_t policy = APH_ORIGINAL_ONCE;
     static Payload Pack(void* self, float delta, void* method) { return {self, delta, 0, method}; }
 };
+// Matches the v1 contract already used by AntiKick and EndfieldVR.
+struct GameAppUpdateSpec {
+    using Function = void(*)(void*, void*);
+    using Payload = APH_EfVoid;
+    static constexpr const char* signature = "void(self*,MethodInfo*)";
+    static constexpr const char* contract = APH_EF_GAMEAPP_UPDATE;
+    static constexpr uint32_t policy = APH_ORIGINAL_ONCE;
+    static Payload Pack(void* self, void* method) { return {self, method}; }
+};
 struct MorphJobSpec {
     // Verified IL2CPP native form: explicit 16-byte result buffer and dependency
     // address. Do not substitute a guessed C++ struct-by-value signature.
@@ -151,6 +160,7 @@ template<unsigned Tag> using SetMainI32 = detail::Adapter<Tag, detail::SetMainI3
 template<unsigned Tag> using SetMainBool = detail::Adapter<Tag, detail::SetMainBoolSpec>;
 template<unsigned Tag> using BipedIK = detail::Adapter<Tag, detail::BipedIKSpec>;
 template<unsigned Tag> using SMCUpdate = detail::Adapter<Tag, detail::SMCUpdateSpec>;
+template<unsigned Tag> using GameAppUpdate = detail::Adapter<Tag, detail::GameAppUpdateSpec>;
 template<unsigned Tag> using MorphJob = detail::Adapter<Tag, detail::MorphJobSpec>;
 template<unsigned Tag> using SpecialMorphJob = detail::Adapter<Tag, detail::SpecialMorphJobSpec>;
 template<unsigned Tag> using CreateBindingByActionId = detail::Adapter<Tag, detail::InputBindingSpec>;

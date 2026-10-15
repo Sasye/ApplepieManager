@@ -25,5 +25,6 @@ typedef struct APH_EfInputBinding {
 #define APH_EF_SETMAIN_BOOL "endfield.SetMainCharacter.reason-bool"
 #define APH_EF_BIPED "endfield.BipedIK.UpdateSolver.controlled-void"
 #define APH_EF_UPDATE "endfield.SkeletalMorphCore.Update"
+#define APH_EF_GAMEAPP_UPDATE "endfield.GameApp.Update"
 #define APH_EF_JOB "endfield.SkeletalMorphCore.MorphJob.schedule"
 #define APH_EF_INPUT_BINDING "endfield.InputManager.CreateBindingByActionId"

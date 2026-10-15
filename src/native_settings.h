@@ -2,6 +2,7 @@
 #include "hub_internal.h"
 #include "manager_events.h"
 #include "config_key_input.h"
+#include "../sdk/applepie_endfield_adapters.h"
 #include <charconv>
 #include <cmath>
 #include <initializer_list>
@@ -12,9 +13,15 @@
 extern manager_config::Settings g_managerConfig;
 namespace native_settings {
 static constexpr char Prefix[] = "@ApplepieMenu/v1/";
-static APH_Hook loadClaim, tickClaim;
+static APH_Hook loadClaim;
+using MenuUpdate = applepie::endfield::GameAppUpdate<111>;
+static applepie::Subscription updateObserver;
 static void* (*loadOriginal)(void*, void*, void*);
-static void (*tickOriginal)(void*, float, void*);
+static void (*staticFieldValue)(void*, void*);
+static void* (*fieldType)(void*);
+static uint32_t (*fieldFlags)(void*);
+static bool (*isLuaGCing)(void*);
+static void* luaInstanceField;
 static void* doStringMethod;
 static void *luaKeyMethod, *encryptMethod, *decryptMethod, *stringClass;
 static uintptr_t (*arrayLength)(void*);
@@ -33,11 +40,12 @@ static APH_Route windowRoute;
 static std::string source, message;
 static bool installed, failed, visible, english, keyFinished;
 static int selected = -1;
-static unsigned startupAttempts;
 static ULONGLONG nextAttempt;
 static bool encodingChecked;
 static std::string startupStatus;
-// Window notifications only record a key. Saving and Lua calls run at Tick.
+static bool updateObserved, scopeObserved;
+static __declspec(thread) bool pumping;
+// Window notifications only record a key. Saving and Lua calls run after Update.
 static std::atomic<int> captureResult{0}; // -2 waiting, -1 cancelled, >0 VK
 static unsigned capturePlugin, captureField;
 static uint64_t captureRevision;
@@ -273,7 +281,20 @@ static void command(const std::string& path) {
         size_t from = sizeof(Prefix) - 1;
         for (;;) { auto slash = path.find('/', from); parts.push_back(path.substr(from, slash - from)); if (slash == std::string::npos) break; from = slash + 1; }
         const auto& verb = parts.at(0);
-        if (verb == "ready" && parts.size() == 1) { installed = true; Log("[AM-Menu] Native settings tab registered"); return; }
+        if (verb == "session-ended" && parts.size() == 1) {
+            // Lua state, panel references and callbacks belong to one game
+            // session. Returning to login does not unload this DLL.
+            installed = failed = visible = keyFinished = encodingChecked = false;
+            selected = -1; captureResult = 0;
+            capturePlugin = captureField = 0; captureRevision = 0;
+            message.clear(); startupStatus.clear(); nextAttempt = 0;
+            manager_events::notify();
+            Log("[AM-Menu] Lua session ended; menu registration will restart in the next environment");
+            return;
+        }
+        if (verb == "ready" && parts.size() == 1) { installed = true; Log("[AM-Menu] Native settings bridge ready; panel hooks verified"); return; }
+        if (verb == "tab-ready" && parts.size() == 1) { Log("[AM-Menu] Applepie tab attached to GameSetting panel"); return; }
+        if (verb == "panel-error" && parts.size() == 2) { Log("[AM-Menu] Panel integration failed: %s", unhex(parts[1]).c_str()); return; }
         if (verb == "icon-error" && parts.size() == 2) { Log("[AM-Menu] Tab icon unavailable: %s", unhex(parts[1]).c_str()); return; }
         if (verb == "close" && parts.size() == 1) { visible = false; captureResult = 0; return; }
         if (verb == "cancel-key" && parts.size() == 1) { captureResult = 0; return; }
@@ -326,7 +347,7 @@ static void command(const std::string& path) {
     }
 }
 
-// Helpers run inside the game-thread VM boundary. No managed roots survive Tick.
+// Helpers run inside the game-thread VM boundary. No managed roots survive Update.
 struct ManagedRoot {
     uint32_t handle;
     explicit ManagedRoot(void* object) : handle(object ? p_il2cpp_gchandle_new(object, 0) : 0) {
@@ -349,7 +370,7 @@ static void* invoke(void* method, void* self, void** args, const char* stage) {
 static void menuFailure(const char* description) {
     failed = true;
     Log("[AM-Menu] %s", description);
-    hub::error_detail(g_uidOwner, "native-menu", APH_E_UNAVAILABLE, "GameSettingCtrl", 0, tickClaim, 0, 0, description);
+    hub::error_detail(g_uidOwner, "native-menu", APH_E_UNAVAILABLE, "GameSettingCtrl", 0, 0, 0, 0, description);
 }
 static void runLua(void* manager, const std::string& code, std::string* status = nullptr) {
     ManagedRoot text(p_il2cpp_string_new(code.c_str()));
@@ -383,17 +404,25 @@ static void runLua(void* manager, const std::string& code, std::string* status =
     if (!first || objectClass(first) != stringClass) throw std::runtime_error("Menu bootstrap returned an invalid status");
     *status = managedString(first);
 }
-static void pump(void* manager) {
+static void startupWaiting(const std::string& status) {
+    if (status != startupStatus) { startupStatus = status; Log("[AM-Menu] Menu bootstrap: %s", status.c_str()); }
+}
+static void pump() {
     try {
+        // Resolve an existing instance only when initialization or a UI event has
+        // work. Never invoke a generic singleton getter or retain a raw instance.
+        if (!installed) nextAttempt = GetTickCount64() + 1000;
+        void* instance = nullptr;
+        staticFieldValue(luaInstanceField, &instance);
+        if (!instance) { if (!installed) startupWaiting("waiting:LuaManager.instance"); return; }
+        ManagedRoot manager(instance);
+        // Lua GC can run asynchronously in this client. Leave events queued while
+        // it is running instead of entering Lua or blocking the game thread.
+        if (isLuaGCing(nullptr)) return;
         if (!installed) {
-            const auto now = GetTickCount64(); if (now < nextAttempt) return;
-            nextAttempt = now + 1000;
-            if (++startupAttempts > 30) {
-                menuFailure(("Native menu initialization timed out: " + startupStatus).c_str()); return;
-            }
             std::string status;
-            runLua(manager, source, &status);
-            if (status != startupStatus) { startupStatus = status; Log("[AM-Menu] Menu bootstrap: %s", status.c_str()); }
+            runLua(manager.get(), source, &status);
+            startupWaiting(status);
             if (status == "ready" && !installed) throw std::runtime_error("Menu script loaded but the native command bridge did not acknowledge it");
             if (status != "ready" && status.compare(0, 8, "waiting:") != 0) throw std::runtime_error("Menu bootstrap returned an unknown status");
             if (!installed) return;
@@ -406,7 +435,7 @@ static void pump(void* manager) {
             manager_events::notify();
         }
         if (!manager_events::changed.exchange(false, std::memory_order_acq_rel) || !visible) return;
-        runLua(manager, "assert(_G.ApplepieNativeSettings, 'Native settings script disappeared').OnEvent(" + snapshot() + ")");
+        runLua(manager.get(), "assert(_G.ApplepieNativeSettings, 'Native settings script disappeared').OnEvent(" + snapshot() + ")");
     } catch (const std::exception& e) { menuFailure(e.what()); }
 }
 static int beginScope() {
@@ -423,7 +452,8 @@ static bool dispatchPath(void* path) noexcept {
     try {
         auto name = managedString(path);
         if (name.compare(0, sizeof(Prefix) - 1, Prefix) != 0) return false;
-        if (!failed) command(name);
+        // A failed old environment must still be able to end its session.
+        if (!failed || name == "@ApplepieMenu/v1/session-ended") command(name);
         return true;
     } catch (const std::exception& e) {
         Log("[AM-Menu] Command decoding failed: %s", e.what());
@@ -446,17 +476,28 @@ static void* loadEntry(void* self, void* path, void* method) {
     } __finally { endScope(scope); if (admitted == APH_OK) g_uidHooks.leave_call(g_uidOwner, &call); }
     return out;
 }
-static void tickEntry(void* self, float delta, void* method) {
-    APH_HookCall call{}; const auto admitted = g_uidHooks.enter_call(g_uidOwner, tickClaim, &call);
-    volatile uint32_t phase = APH_ORIGINAL_NOT_ENTERED; int scope = 0;
+static APH_Result APH_CALL onUpdate(APH_Owner, const APH_SharedEvent* event, void*) {
+    if (!event || event->phase != APH_AFTER || event->payload_bytes != sizeof(APH_EfVoid)) return APH_E_ARGUMENT;
+    int scope = 0;
+    bool ownsPump = false;
+    // The shared provider calls original exactly once and supplies the native
+    // fault boundary. This subscriber never installs a competing Update hook.
     __try {
-        __try {
-            phase = APH_ORIGINAL_RUNNING; tickOriginal(self, delta, method); phase = APH_ORIGINAL_RETURNED;
-            if (admitted == APH_OK && (call.flags & APH_CALL_BUSINESS) && !failed && (!installed || manager_events::changed.load(std::memory_order_acquire))) {
-                scope = beginScope(); if (scope) pump(self);
+        if (!updateObserved) {
+            updateObserved = true;
+            Log("[AM-Menu] Shared GameApp.Update reached: thread=%lu", GetCurrentThreadId());
+        }
+        if (!failed && !pumping &&
+            (installed ? manager_events::changed.load(std::memory_order_acquire) : GetTickCount64() >= nextAttempt)) {
+            scope = beginScope();
+            if (scope) {
+                if (!scopeObserved) { scopeObserved = true; Log("[AM-Menu] Game-thread menu dispatch ready"); }
+                pumping = ownsPump = true;
+                pump();
             }
-        } __except(APH_EntryFilter(&g_uidHooks, g_uidOwner, tickClaim, GetExceptionInformation(), phase, APH_RECOVERY_NONE)) {}
-    } __finally { endScope(scope); if (admitted == APH_OK) g_uidHooks.leave_call(g_uidOwner, &call); }
+        }
+    } __finally { if (ownsPump) pumping = false; endScope(scope); }
+    return APH_OK;
 }
 static bool namedType(void* type, const char* expected) {
     char* name = typeName(type); if (!name) return false;
@@ -477,12 +518,14 @@ static void* findMethod(void* klass, const char* name, const char* returns, std:
     }
     return match;
 }
-static bool resolve(void* domain, void** loadTarget, void** tickTarget) {
+static bool resolve(void* domain, void** loadTarget, void** updateTarget) {
 #define MENU_EXPORT(name, exportName) name = reinterpret_cast<decltype(name)>(GetProcAddress(g_hGameAssembly, exportName)); if (!name) return false
     MENU_EXPORT(methods, "il2cpp_class_get_methods"); MENU_EXPORT(methodName, "il2cpp_method_get_name");
     MENU_EXPORT(methodParam, "il2cpp_method_get_param"); MENU_EXPORT(typeName, "il2cpp_type_get_name");
     MENU_EXPORT(freeMemory, "il2cpp_free"); MENU_EXPORT(stringLength, "il2cpp_string_length"); MENU_EXPORT(stringChars, "il2cpp_string_chars");
     MENU_EXPORT(arrayLength, "il2cpp_array_length"); MENU_EXPORT(objectClass, "il2cpp_object_get_class");
+    MENU_EXPORT(staticFieldValue, "il2cpp_field_static_get_value"); MENU_EXPORT(fieldType, "il2cpp_field_get_type");
+    MENU_EXPORT(fieldFlags, "il2cpp_field_get_flags");
 #undef MENU_EXPORT
     const auto headerSize = reinterpret_cast<uint32_t(*)()>(GetProcAddress(g_hGameAssembly, "il2cpp_array_object_header_size"));
     if (!headerSize) return false;
@@ -497,10 +540,17 @@ static bool resolve(void* domain, void** loadTarget, void** tickTarget) {
         if (!strcmp(imageName, "Lua.Beyond.dll")) {
             auto klass = p_il2cpp_class_from_name(image, "Beyond.Lua", "LuaManager");
             auto load = findMethod(klass, "LoadLua", "System.Byte[]", {"System.String"});
-            auto tick = findMethod(klass, "Tick", "System.Void", {"System.Single"});
+            auto gc = findMethod(klass, "IsLuaGCing", "System.Boolean", {}, true);
             doStringMethod = findMethod(klass, "DoString", "System.Object[]", {"System.String"});
-            if (!load || !tick || !doStringMethod) return false;
-            *loadTarget = *reinterpret_cast<void**>(load); *tickTarget = *reinterpret_cast<void**>(tick);
+            luaInstanceField = klass ? p_il2cpp_class_get_field_from_name(klass, "<instance>k__BackingField") : nullptr;
+            if (!load || !gc || !doStringMethod || !luaInstanceField || !(fieldFlags(luaInstanceField) & 0x10) ||
+                !namedType(fieldType(luaInstanceField), "Beyond.Lua.LuaManager")) return false;
+            *loadTarget = *reinterpret_cast<void**>(load);
+            isLuaGCing = reinterpret_cast<decltype(isLuaGCing)>(*reinterpret_cast<void**>(gc));
+        } else if (!strcmp(imageName, "Entry.Beyond.dll")) {
+            auto update = findMethod(p_il2cpp_class_from_name(image, "Beyond", "GameApp"), "Update", "System.Void", {});
+            if (!update) return false;
+            *updateTarget = *reinterpret_cast<void**>(update);
         } else if (!strcmp(imageName, "XLua.Runtime.dll")) {
             auto cypher = p_il2cpp_class_from_name(image, "Beyond.Lua", "LuaCypher");
             luaKeyMethod = findMethod(cypher, "GetKey", "System.String", {}, true);
@@ -511,15 +561,15 @@ static bool resolve(void* domain, void** loadTarget, void** tickTarget) {
             stringClass = p_il2cpp_class_from_name(image, "System", "String");
         }
     }
-    return *loadTarget && *tickTarget && doStringMethod && luaKeyMethod && decryptMethod && encryptMethod && stringClass;
+    return *loadTarget && *updateTarget && isLuaGCing && doStringMethod && luaKeyMethod && decryptMethod && encryptMethod && stringClass;
 }
-static bool metadata(void** load, void** tick) {
+static bool metadata(void** load, void** update) {
     bool ok = false; void* attached = nullptr;
     AcquireSRWLockShared(&g_uidVmLock); g_uidVmHeld = true;
     __try {
         if (UidRuntimeOpen() && g_uidBootstrap.Ready()) {
             void* domain = g_uidBootstrap.AttachWorker(&attached);
-            if (domain) ok = resolve(domain, load, tick);
+            if (domain) ok = resolve(domain, load, update);
         }
     } __finally { g_uidBootstrap.DetachWorker(attached); g_uidVmHeld = false; ReleaseSRWLockShared(&g_uidVmLock); }
     return ok;
@@ -531,19 +581,27 @@ static bool install() {
     if (script.empty() || icon.empty()) { Log("[AM-Menu] Embedded menu script or icon is missing"); return false; }
     source = "local applepieTabIconBase64 = " + quote(base64(icon)) + "\n";
     source.append(script);
-    void* loadTarget = nullptr; void* tickTarget = nullptr;
-    if (!metadata(&loadTarget, &tickTarget)) { Log("[AM-Menu] LuaManager / LuaCypher / XXTEA ABI unavailable; no menu hooks installed"); return false; }
+    void* loadTarget = nullptr; void* updateTarget = nullptr;
+    if (!metadata(&loadTarget, &updateTarget)) { Log("[AM-Menu] GameApp / LuaManager / LuaCypher / XXTEA ABI unavailable; no menu hooks installed"); return false; }
     if (hub::api()->copy_service(g_uidOwner, APH_SERVICE_WINDOWS, 1, sizeof(windows), &windows) != APH_OK) return false;
     APH_NativeProc original = nullptr;
     if (!PrepareUidHook(loadTarget, reinterpret_cast<APH_NativeProc>(loadEntry), 110,
         "ptr(ptr,ptr,ptr) LuaManager.LoadLua(string)+MethodInfo", &loadClaim, &original)) return false;
     loadOriginal = reinterpret_cast<decltype(loadOriginal)>(original);
     if (g_uidHooks.activate_hook(g_uidOwner, loadClaim, original) < 0 || !WaitUidHook(loadClaim, APH_HOOK_ACTIVE)) return false;
-    if (!PrepareUidHook(tickTarget, reinterpret_cast<APH_NativeProc>(tickEntry), 111,
-        "void(ptr,float,ptr) LuaManager.Tick(float)+MethodInfo", &tickClaim, &original)) return false;
-    tickOriginal = reinterpret_cast<decltype(tickOriginal)>(original);
-    if (g_uidHooks.activate_hook(g_uidOwner, tickClaim, original) < 0 || !WaitUidHook(tickClaim, APH_HOOK_ACTIVE)) return false;
-    Log("[AM-Menu] LuaManager ABI checked; native settings hooks active");
-    return true;
+    if (MenuUpdate::Request(g_uidClient, 111, reinterpret_cast<void(*)(void*, void*)>(updateTarget)) < 0) return false;
+    // Finish provider/member activation before opening the callback, so every
+    // dependency above is published even when another plugin already owns it.
+    for (unsigned i = 0; i < 500 && UidRuntimeOpen(); ++i) {
+        const auto status = MenuUpdate::Advance();
+        if (status == APH_OK) {
+            if (MenuUpdate::Listen(updateObserver, onUpdate, nullptr, APH_AFTER) != APH_OK) return false;
+            Log("[AM-Menu] GameApp.Update / LuaManager ABI checked; shared menu dispatch active");
+            return true;
+        }
+        if (status < 0 && status != APH_E_BUSY) return false;
+        Sleep(10);
+    }
+    return false;
 }
 }

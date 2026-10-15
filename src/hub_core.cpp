@@ -12,9 +12,12 @@
 #include <cwchar>
 #include <cstdlib>
 #include <atomic>
+#include <memory>
+#include <stdexcept>
+#include <vector>
 
 namespace {
-constexpr unsigned MaxOwners = 64, MaxHooks = 128, MaxSubscriptions = 128, MaxDepth = 32;
+constexpr unsigned MaxOwners = 64, MaxSubscriptions = 128, MaxDepth = 32;
 constexpr LONG64 Closed = (LONG64)(UINT64_C(1) << 63);
 struct Owner {
     // IDs/modules are never recycled. Published (1) and terminally closed (2)
@@ -56,12 +59,14 @@ struct Subscription {
     volatile LONG64 gate;
     bool pending_notice;
 };
-struct CallFrame { APH_Owner owner; APH_Hook hook; bool admitted; };
+struct CallFrame { APH_Owner owner; APH_Hook hook; Hook* record; bool admitted; };
 SRWLOCK registry = SRWLOCK_INIT;
 Owner owners[MaxOwners]{};
-Hook hooks[MaxHooks]{};
+// Only the index grows. Published records stay at the same address for their
+// entire module lifetime, including backend work outside registry and leave_call.
+std::vector<std::unique_ptr<Hook>> hooks;
 Subscription subscriptions[MaxSubscriptions]{};
-unsigned owner_count, hook_count, subscription_count;
+unsigned owner_count, subscription_count;
 HANDLE wake_event;
 BoundedLog core_log;
 volatile LONG is_ready, backend_frozen;
@@ -86,7 +91,16 @@ void close_gate(volatile LONG64* gate) { InterlockedOr64(gate, Closed); }
 uint32_t flights(volatile LONG64* gate) { return (uint32_t)(read_gate(gate) & ~Closed); }
 Owner* owner_at(APH_Owner id) { return id && id <= owner_count ? &owners[id - 1] : nullptr; }
 Hook* hook_at(APH_Owner owner, APH_Hook id) {
-    return id && id <= hook_count && hooks[id - 1].owner == owner ? &hooks[id - 1] : nullptr;
+    return id && id <= hooks.size() && hooks[id - 1]->owner == owner ? hooks[id - 1].get() : nullptr;
+}
+// Called under registry, before publishing a claim. Keep C++ allocation failures
+// inside this helper rather than allowing them across the C/SEH API boundary.
+Hook* append_hook() noexcept {
+    try {
+        hooks.emplace_back(std::make_unique<Hook>());
+        return hooks.back().get();
+    } catch (const std::bad_alloc&) { return nullptr; }
+      catch (const std::length_error&) { return nullptr; }
 }
 bool usable(Owner* o) {
     return o && o->state < APH_OWNER_FAILED && !InterlockedCompareExchange(&o->fault_record, 0, 0);
@@ -173,8 +187,8 @@ APH_Result request_hook_impl(APH_Owner id, const APH_HookRequest* input, APH_Hoo
         if (!hub::runtime_mutations_allowed()) return APH_E_REVOKED;
         if (entry_module != o->module) return APH_E_ARGUMENT;
         if (backend_frozen) return APH_E_NEEDS_RESTART;
-        for (unsigned i = 0; i < hook_count; ++i) {
-            Hook* h = &hooks[i];
+        for (size_t i = 0; i < hooks.size(); ++i) {
+            Hook* h = hooks[i].get();
             if (h->owner == id && h->request.request_key == r.request_key) {
                 if (h->request.target != r.target || h->request.native_entry != r.native_entry ||
                     h->request.mode != r.mode || h->request.recovery != r.recovery ||
@@ -194,16 +208,18 @@ APH_Result request_hook_impl(APH_Owner id, const APH_HookRequest* input, APH_Hoo
                 return APH_E_CONFLICT; // one typed entry/context binds exactly one live target
         }
         if (r.mode != APH_EXCLUSIVE && !(shared && r.mode == APH_SHARED_TYPED)) return APH_E_MODE;
-        if (hook_count == MaxHooks) return APH_E_QUEUE_FULL;
-        Hook* h = &hooks[hook_count];
-        if (!safe_copy(h->entry_bytes, (void*)r.target, sizeof(h->entry_bytes))) return APH_E_ARGUMENT;
+        unsigned char entry_bytes[16]{};
+        if (!safe_copy(entry_bytes, (void*)r.target, sizeof(entry_bytes))) return APH_E_ARGUMENT;
+        Hook* h = append_hook();
+        if (!h) return APH_E_QUEUE_FULL;
         // Native export/import thunks also start with JMP. Let the backend
         // relocate the requested entry; activation still checks this snapshot.
-        APH_Hook value = hook_count + 1;
-        if (!safe_copy(out, &value, sizeof(value))) return APH_E_ARGUMENT;
+        APH_Hook value = hooks.size();
+        if (!safe_copy(out, &value, sizeof(value))) { hooks.pop_back(); return APH_E_ARGUMENT; }
+        memcpy(h->entry_bytes, entry_bytes, sizeof(entry_bytes));
         h->request = r; h->owner = id; h->state = APH_HOOK_PENDING;
         h->operation = 1; h->result = APH_PENDING; h->closed = 1;
-        ++hook_count; // target lookup and reservation are one critical section
+        // Target lookup, reservation and publication are one critical section.
         result = APH_PENDING;
     } __finally { ReleaseSRWLockExclusive(&registry); }
     SetEvent(wake_event);
@@ -283,7 +299,7 @@ APH_Result APH_CALL enter_call(APH_Owner owner, APH_Hook id, APH_HookCall* out) 
             InterlockedDecrement(&h->in_flight);
             return APH_E_ARGUMENT;
         }
-        call_stack[call_depth++] = {owner, id, admitted};
+        call_stack[call_depth++] = {owner, id, h, admitted};
     } __finally { ReleaseSRWLockShared(&registry); }
     return APH_OK;
 }
@@ -294,7 +310,9 @@ APH_Result APH_CALL leave_call(APH_Owner owner, const APH_HookCall* input) {
     if (f.owner != owner || f.hook != call.hook) return APH_E_ARGUMENT;
     --call_depth;
     if (f.admitted) InterlockedDecrement64(&owners[owner - 1].gate);
-    InterlockedDecrement(&hooks[call.hook - 1].in_flight);
+    // Do not read the growing index without registry. The admitted record is
+    // permanent even if another thread appends hooks while this call executes.
+    InterlockedDecrement(&f.record->in_flight);
     return APH_OK;
 }
 APH_Result APH_CALL owner_status(APH_Owner id, uint32_t bytes, APH_OwnerStatus* out) {
@@ -314,8 +332,8 @@ APH_Result APH_CALL owner_status(APH_Owner id, uint32_t bytes, APH_OwnerStatus* 
             value.state = recoverable ? APH_OWNER_FAULTED : APH_OWNER_NEEDS_RESTART;
             value.result = recoverable ? APH_E_FAULT : APH_E_NEEDS_RESTART;
         }
-        for (unsigned i = 0; i < hook_count; ++i)
-            if (hooks[i].owner == id && hooks[i].state != APH_HOOK_RELEASED && hooks[i].state != APH_HOOK_FAILED) ++value.resource_count;
+        for (const auto& h : hooks)
+            if (h->owner == id && h->state != APH_HOOK_RELEASED && h->state != APH_HOOK_FAILED) ++value.resource_count;
         for (unsigned i = 0; i < subscription_count; ++i)
             if (subscriptions[i].owner == id && (!(read_gate(&subscriptions[i].gate) & Closed) || flights(&subscriptions[i].gate))) ++value.resource_count;
     } __finally { ReleaseSRWLockShared(&registry); }
@@ -370,8 +388,8 @@ APH_Result APH_CALL copy_service(APH_Owner id, uint64_t service, uint32_t major,
 void close_owner_resources(APH_Owner id, bool cleanup) {
     Owner* o = &owners[id - 1]; close_gate(&o->gate);
     for (unsigned i = 0; i < subscription_count; ++i) if (subscriptions[i].owner == id) close_gate(&subscriptions[i].gate);
-    for (unsigned i = hook_count; i > 0; --i) if (hooks[i - 1].owner == id) {
-        Hook* h = &hooks[i - 1];
+    for (size_t i = hooks.size(); i > 0; --i) if (hooks[i - 1]->owner == id) {
+        Hook* h = hooks[i - 1].get();
         // Shared provider is a module-lifetime adapter, not this owner's business
         // callback. Its listeners independently use owner admission below.
         if (h->request.mode == APH_SHARED_TYPED) continue;
@@ -412,7 +430,11 @@ void dispatch_notices() {
 DWORD WINAPI control_thread(void*) {
     for (;;) {
         WaitForSingleObject(wake_event, 20);
-        for (unsigned i = 0; i < MaxHooks; ++i) {
+        // Bound this pass so concurrent requests cannot starve other services.
+        AcquireSRWLockShared(&registry);
+        const size_t scan_count = hooks.size();
+        ReleaseSRWLockShared(&registry);
+        for (size_t i = 0; i < scan_count || i == 0; ++i) {
             Hook* h = nullptr; uint32_t operation = 0;
             AcquireSRWLockExclusive(&registry);
             __try {
@@ -435,8 +457,8 @@ DWORD WINAPI control_thread(void*) {
                         write_log(message);
                     }
                 }
-                if (i >= hook_count) break;
-                h = &hooks[i];
+                if (i >= scan_count) break; // process faults even with no hooks
+                h = hooks[i].get();
                 if (h->state == APH_HOOK_NEEDS_RESTART || h->state == APH_HOOK_RELEASED || h->state == APH_HOOK_FAILED || h->state == APH_HOOK_RETIRED_PINNED) continue;
                 if (backend_frozen) {
                     h->state = APH_HOOK_NEEDS_RESTART; h->result = APH_E_NEEDS_RESTART;
